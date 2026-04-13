@@ -1,0 +1,110 @@
+{{- if .Values.installCRD }}
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: netcupfailoverips.netcup.digilol.net
+  labels:
+    {{- include "netcup-failover-controller.labels" . | nindent 4 }}
+spec:
+  group: netcup.digilol.net
+  names:
+    kind: NetcupFailoverIP
+    listKind: NetcupFailoverIPList
+    plural: netcupfailoverips
+    singular: netcupfailoverip
+  scope: Cluster
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Node
+          type: string
+          jsonPath: .status.currentNode
+        - name: Routed
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Routed")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: [spec]
+          properties:
+            spec:
+              type: object
+              required: [ips, credentialsSecret]
+              properties:
+                credentialsSecret:
+                  type: object
+                  description: |
+                    Reference to the Secret containing netcup API credentials.
+                    The Secret must have keys "loginName" and "password".
+                  required: [name, namespace]
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                ips:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+                    description: A failover IP in CIDR notation (e.g. 198.51.100.1/32 or 2001:db8::/64).
+                nodeSelector:
+                  type: object
+                  description: |
+                    Restricts eligible nodes using standard Kubernetes label selector syntax.
+                    Supports matchLabels and matchExpressions.
+                  properties:
+                    matchLabels:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    matchExpressions:
+                      type: array
+                      items:
+                        type: object
+                        required: [key, operator]
+                        properties:
+                          key:
+                            type: string
+                          operator:
+                            type: string
+                            enum: [In, NotIn, Exists, DoesNotExist]
+                          values:
+                            type: array
+                            items:
+                              type: string
+            status:
+              type: object
+              properties:
+                currentNode:
+                  type: string
+                  description: The node the IPs are currently routed to.
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      observedGeneration:
+                        type: integer
+                        format: int64
+
+{{- end }}

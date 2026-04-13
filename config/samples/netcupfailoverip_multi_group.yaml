@@ -1,0 +1,23 @@
+apiVersion: netcup.digilol.net/v1alpha1
+kind: NetcupFailoverIP
+metadata:
+  name: group-a
+spec:
+  ips:
+    - "198.51.100.1/32"
+    - "2001:db8::/64"
+  credentialsSecret:
+    name: netcup-credentials-account1
+    namespace: netcup-system
+---
+apiVersion: netcup.digilol.net/v1alpha1
+kind: NetcupFailoverIP
+metadata:
+  name: group-b
+spec:
+  ips:
+    - "198.51.100.2/32"
+    - "2001:db8::2/64"
+  credentialsSecret:
+    name: netcup-credentials-account2
+    namespace: netcup-system

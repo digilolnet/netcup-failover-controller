@@ -1,0 +1,15 @@
+apiVersion: netcup.digilol.net/v1alpha1
+kind: NetcupFailoverIP
+metadata:
+  name: primary
+spec:
+  ips:
+    - "198.51.100.1/32"
+    - "2001:db8::/64"
+  credentialsSecret:
+    name: netcup-credentials
+    namespace: netcup-system
+  nodeSelector:
+    matchExpressions:
+      - key: node-role.kubernetes.io/control-plane
+        operator: DoesNotExist

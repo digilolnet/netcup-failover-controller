@@ -1,0 +1,17 @@
+apiVersion: v2
+name: netcup-failover-controller
+description: Routes netcup failover IPs to healthy Kubernetes nodes via the netcup SOAP API.
+type: application
+version: 1.0.0
+appVersion: "v1.0.0"
+home: https://github.com/digilolnet/netcup-cloud-controller-manager
+sources:
+  - https://github.com/digilolnet/netcup-cloud-controller-manager
+keywords:
+  - netcup
+  - failover
+  - ip
+  - controller
+maintainers:
+  - name: Digilol
+    url: https://github.com/digilolnet

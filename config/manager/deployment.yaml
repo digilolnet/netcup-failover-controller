@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: netcup-failover-controller
+  namespace: netcup-system
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: netcup-failover-controller
+  template:
+    metadata:
+      labels:
+        app: netcup-failover-controller
+    spec:
+      serviceAccountName: netcup-failover-controller
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      containers:
+        - name: manager
+          image: ghcr.io/digilolnet/netcup-failover-controller:latest
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+            readOnlyRootFilesystem: true
+          resources:
+            limits:
+              cpu: 100m
+              memory: 64Mi
+            requests:
+              cpu: 10m
+              memory: 32Mi

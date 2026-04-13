@@ -1,0 +1,38 @@
+image:
+  repository: ghcr.io/digilolnet/netcup-failover-controller
+  tag: ""  # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+replicaCount: 2
+
+podAnnotations: {}
+
+# Node selector and tolerations for the controller pods themselves.
+# Defaults to control-plane nodes, which is recommended since the controller
+# needs to survive worker node failures.
+nodeSelector:
+  node-role.kubernetes.io/control-plane: ""
+
+tolerations:
+  - key: node-role.kubernetes.io/control-plane
+    effect: NoSchedule
+
+affinity: {}
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 64Mi
+  requests:
+    cpu: 10m
+    memory: 32Mi
+
+# Namespace for the controller and its ServiceAccount.
+# NetcupFailoverIP resources are cluster-scoped and can be created in any namespace.
+namespace: netcup-system
+
+# Whether to create the namespace.
+createNamespace: true
+
+# Whether to install the CRD. Set to false if you manage CRDs separately.
+installCRD: true
