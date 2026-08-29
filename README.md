@@ -1,6 +1,6 @@
 # netcup-failover-controller
 
-A Kubernetes controller that automatically routes [netcup](https://www.netcup.de) failover IPs to healthy cluster nodes via the netcup SOAP API.
+A Kubernetes controller that automatically routes [netcup](https://www.netcup.de) failover IPs to healthy cluster nodes via the netcup SCP REST API (using [go-netcup-scp](https://github.com/digilolnet/go-netcup-scp)).
 
 ## Overview
 
@@ -10,12 +10,14 @@ Multiple `NetcupFailoverIP` resources are spread across different nodes for band
 
 ## How It Works
 
-1. A `NetcupFailoverIP` resource is created with a list of IPs and a reference to a Secret containing netcup credentials.
+1. A `NetcupFailoverIP` resource is created with a list of IPs and a reference to a Secret containing a netcup SCP OAuth token.
 2. The controller lists healthy nodes (optionally filtered by a label selector).
 3. It picks a node deterministically (`hash(resource name) % eligible nodes`), preferring nodes not already hosting another failover IP group.
-4. It fetches the node's MAC address from the netcup SOAP API and calls `ChangeIPRouting` to route each IP there.
+4. It resolves the node's SCP server (via the `netcup.digilol.net/server-name` annotation) and routes each failover IP to it through the SCP REST API, skipping IPs the API already reports as routed there.
 5. Status is updated with the current node and a `Routed` condition.
-6. Node changes trigger re-evaluation for all resources.
+6. Node changes trigger re-evaluation for all resources; a group stays on its current node while that node remains healthy and eligible.
+
+netcup rate-limits failover routing (10 requests per 5 minutes). When the limit is hit the controller records a `RateLimited` condition and retries after 5 minutes — IPs that already routed are never re-routed, so a large group converges across windows.
 
 The controller runs with two replicas and leader election — one active, one standby.
 
@@ -87,7 +89,7 @@ helm install netcup-failover-controller netcup/netcup-failover-controller
 To pin to a specific version:
 
 ```bash
-helm install netcup-failover-controller netcup/netcup-failover-controller --version 1.0.0
+helm install netcup-failover-controller netcup/netcup-failover-controller --version <version>
 ```
 
 ### Manual
@@ -96,22 +98,36 @@ helm install netcup-failover-controller netcup/netcup-failover-controller --vers
 kubectl apply -f config/crd/
 kubectl apply -f config/rbac/
 kubectl apply -f config/manager/
+kubectl apply -f config/admission/   # optional: node-annotation protection (Kubernetes 1.30+)
 ```
 
 
 ## Usage
 
-### 1. Create a credentials Secret
+### 1. Log in (creates the credentials Secret)
 
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: netcup-credentials
-  namespace: netcup-system
-stringData:
-  loginName: "12345"
-  password: "your-netcup-password"
+The controller authenticates against the SCP REST API with an OAuth2 token obtained via the device flow. The `login` subcommand walks you through it and stores the token in the cluster: it prints a URL, you open it in your browser and log in, and the tool picks the token up automatically.
+
+Run it in-cluster through one of the controller pods:
+
+```bash
+kubectl exec -it -n netcup-system deploy/netcup-failover-controller -- /manager login
+```
+
+Or locally with your kubeconfig, if you have the binary:
+
+```bash
+netcup-failover-controller login --secret netcup-system/netcup-credentials
+```
+
+Either way it creates (or updates) the referenced Secret with the token under the `token` key. The controller then writes refreshed tokens back into the Secret, so the one-time login stays valid indefinitely.
+
+Alternatively, seed the Secret from a token file written by the [`netcup-scp` CLI](https://github.com/digilolnet/go-netcup-scp):
+
+```bash
+netcup-scp auth login
+kubectl create secret generic netcup-credentials -n netcup-system \
+  --from-file=token=$HOME/.config/netcup-scp/token.json
 ```
 
 ### 2. Create a NetcupFailoverIP resource
@@ -129,8 +145,9 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials
-    namespace: netcup-system
 ```
+
+`credentialsSecret` names a Secret in the controller's own namespace (`netcup-system` by default) — the controller's RBAC on Secrets is restricted to that namespace, so there is no namespace field to set.
 
 Route to control-plane nodes only:
 
@@ -145,7 +162,6 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials
-    namespace: netcup-system
   nodeSelector:
     matchLabels:
       node-role.kubernetes.io/control-plane: ""
@@ -176,6 +192,8 @@ secondary   k8s-control-plane-2    True     5m
 
 Each `NetcupFailoverIP` resource is an independent group. IPs within a group are always routed to the same node. Groups are spread across different nodes automatically.
 
+Groups may use different netcup accounts (one credentials Secret each). Placement is account-aware: a group only considers nodes whose `netcup.digilol.net/server-name` annotation names a server of *its* account, so clusters mixing nodes from several accounts need no extra labels or selectors.
+
 Example — two independent groups, each with an IPv4 and IPv6 pair, using different netcup accounts:
 
 ```yaml
@@ -189,7 +207,6 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials-account1
-    namespace: netcup-system
 ---
 apiVersion: netcup.digilol.net/v1alpha1
 kind: NetcupFailoverIP
@@ -201,7 +218,23 @@ spec:
     - "2001:db8::2/64"
   credentialsSecret:
     name: netcup-credentials-account2
-    namespace: netcup-system
+```
+
+## Security
+
+- **Least-privilege RBAC** — Secret access (`get`/`create`/`update`) is a namespaced Role limited to the controller's namespace, and `credentialsSecret` is name-only, always resolved there; cluster-wide the controller can only watch nodes and its own CRD. A compromised controller cannot read or overwrite Secrets of other workloads.
+- **Hardened pods** — distroless nonroot image, read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp, no privilege escalation, pod anti-affinity across nodes.
+- **NetworkPolicy** (`networkPolicy.enabled`, default on) — egress limited to DNS and TCP 443/6443, ingress to health probes; the metrics server is disabled entirely.
+- **Node annotation protection** (`nodeAnnotationProtection.enabled`, default on, requires Kubernetes 1.30+) — a `ValidatingAdmissionPolicy` prevents kubelets from changing their own node's `netcup.digilol.net/server-name` annotation, so a compromised node cannot redirect failover IPs to another server.
+- **No long-lived passwords** — OAuth2 device flow only; the token lives in a Secret and rotations are persisted automatically.
+- **CI/supply chain** — `govulncheck` and `gosec` gate every PR, dependencies are updated by Dependabot, GitHub Actions are pinned to commit SHAs, and release images are signed with cosign (keyless) and published with provenance and SBOM attestations.
+
+Verify a release image:
+
+```bash
+cosign verify ghcr.io/digilolnet/netcup-failover-controller:<tag> \
+  --certificate-identity-regexp 'https://github.com/digilolnet/netcup-failover-controller/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 ## Development
@@ -211,27 +244,37 @@ spec:
 go build ./...
 
 # Test
-go test ./...
+go test -race ./...
 
 # Lint
 golangci-lint run
 
-# Build and push Docker image (multi-arch) — build binaries first, then push
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/manager-linux-amd64 .
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/manager-linux-arm64 .
-docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/digilolnet/netcup-failover-controller:v1.0.0 --push .
+# Security scan (same gates as CI)
+govulncheck ./...
+gosec -exclude-dir=agent ./...
 ```
+
+The netcup endpoints can be overridden — e.g. for a mock API — via `NETCUP_SCP_API_URL` (SCP REST base) and `NETCUP_SCP_AUTH_URL` (OpenID Connect base), or the `netcup.apiUrl` / `netcup.authUrl` Helm values. Empty means the production endpoints.
+
+The controller also runs out-of-cluster against your kubeconfig — useful for development, since leader election is pinned to the `netcup-system` namespace. Scale the in-cluster deployment to 0 first so it releases the lease:
+
+```bash
+kubectl -n netcup-system scale deploy netcup-failover-controller --replicas=0
+go run .
+```
+
+Release images are built, signed, and pushed by CI on version tags — see below. Avoid pushing images manually; they would lack the cosign signature and provenance/SBOM attestations.
 
 ## Releases
 
 Docker images are published to `ghcr.io/digilolnet/netcup-failover-controller` on every version tag. Push a tag to trigger a release:
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-Images are tagged as `v1.0.0`, `v1.0`, and `v1`.
+Everything is derived from the tag — no version bumps in the repo are needed. Images are tagged as `X.Y.Z`, `X.Y`, `X`, and `latest`, signed with cosign, and published with provenance and SBOM attestations. The same workflow sets the chart's `version`/`appVersion` from the tag, packages it, and publishes it to the Helm repo on GitHub Pages.
 
 ## License
 
