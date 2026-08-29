@@ -15,7 +15,9 @@ Multiple `NetcupFailoverIP` resources are spread across different nodes for band
 3. It picks a node deterministically (`hash(resource name) % eligible nodes`), preferring nodes not already hosting another failover IP group.
 4. It resolves the node's SCP server (via the `netcup.digilol.net/server-name` annotation) and routes each failover IP to it through the SCP REST API, skipping IPs the API already reports as routed there.
 5. Status is updated with the current node and a `Routed` condition.
-6. Node changes trigger re-evaluation for all resources.
+6. Node changes trigger re-evaluation for all resources; a group stays on its current node while that node remains healthy and eligible.
+
+netcup rate-limits failover routing (10 requests per 5 minutes). When the limit is hit the controller records a `RateLimited` condition and retries after 5 minutes — IPs that already routed are never re-routed, so a large group converges across windows.
 
 The controller runs with two replicas and leader election — one active, one standby.
 
@@ -96,6 +98,7 @@ helm install netcup-failover-controller netcup/netcup-failover-controller --vers
 kubectl apply -f config/crd/
 kubectl apply -f config/rbac/
 kubectl apply -f config/manager/
+kubectl apply -f config/admission/   # optional: node-annotation protection (Kubernetes 1.30+)
 ```
 
 
@@ -217,7 +220,7 @@ spec:
 
 ## Security
 
-- **Least-privilege RBAC** — Secret access (`get`/`create`/`update`) is a namespaced Role limited to the controller's namespace, matched by an in-controller check on `credentialsSecret`; cluster-wide the controller can only read nodes and its own CRD. A compromised controller cannot read or overwrite Secrets of other workloads.
+- **Least-privilege RBAC** — Secret access (`get`/`create`/`update`) is a namespaced Role limited to the controller's namespace, and `credentialsSecret` is name-only, always resolved there; cluster-wide the controller can only watch nodes and its own CRD. A compromised controller cannot read or overwrite Secrets of other workloads.
 - **Hardened pods** — distroless nonroot image, read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp, no privilege escalation, pod anti-affinity across nodes.
 - **NetworkPolicy** (`networkPolicy.enabled`, default on) — egress limited to DNS and TCP 443/6443, ingress to health probes; the metrics server is disabled entirely.
 - **Node annotation protection** (`nodeAnnotationProtection.enabled`, default on, requires Kubernetes 1.30+) — a `ValidatingAdmissionPolicy` prevents kubelets from changing their own node's `netcup.digilol.net/server-name` annotation, so a compromised node cannot redirect failover IPs to another server.
@@ -239,16 +242,24 @@ cosign verify ghcr.io/digilolnet/netcup-failover-controller:<tag> \
 go build ./...
 
 # Test
-go test ./...
+go test -race ./...
 
 # Lint
 golangci-lint run
 
-# Build and push Docker image (multi-arch) — build binaries first, then push
-CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/manager-linux-amd64 .
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o bin/manager-linux-arm64 .
-docker buildx build --platform linux/amd64,linux/arm64 --tag ghcr.io/digilolnet/netcup-failover-controller:v1.0.0 --push .
+# Security scan (same gates as CI)
+govulncheck ./...
+gosec -exclude-dir=agent ./...
 ```
+
+The controller also runs out-of-cluster against your kubeconfig — useful for development, since leader election is pinned to the `netcup-system` namespace. Scale the in-cluster deployment to 0 first so it releases the lease:
+
+```bash
+kubectl -n netcup-system scale deploy netcup-failover-controller --replicas=0
+go run .
+```
+
+Release images are built, signed, and pushed by CI on version tags — see below. Avoid pushing images manually; they would lack the cosign signature and provenance/SBOM attestations.
 
 ## Releases
 
@@ -259,7 +270,7 @@ git tag v1.0.0
 git push origin v1.0.0
 ```
 
-Images are tagged as `v1.0.0`, `v1.0`, and `v1`.
+Images are tagged as `1.0.0`, `1.0`, `1`, and `latest`, signed with cosign, and published with provenance and SBOM attestations. The Helm chart is packaged and published to the gh-pages repo by the same workflow.
 
 ## License
 
