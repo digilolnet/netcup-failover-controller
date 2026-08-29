@@ -80,10 +80,6 @@ type NetcupFailoverIPList struct {
 	Items           []NetcupFailoverIP `json:"items"`
 }
 
-func init() {
-	SchemeBuilder.Register(&NetcupFailoverIP{}, &NetcupFailoverIPList{})
-}
-
 // DeepCopy methods — required to satisfy runtime.Object.
 
 func (in *NetcupFailoverIP) DeepCopyObject() runtime.Object {

@@ -2,6 +2,8 @@ module github.com/digilolnet/netcup-failover-controller
 
 go 1.26.0
 
+toolchain go1.27.0
+
 require (
 	github.com/digilolnet/go-netcup-scp v0.1.0
 	k8s.io/api v0.36.2

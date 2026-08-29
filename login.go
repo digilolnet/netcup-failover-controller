@@ -88,14 +88,15 @@ func deviceLogin(ctx context.Context, idp deviceAuthorizer, out io.Writer) (*aut
 	if uri == "" {
 		uri = da.VerificationURI
 	}
-	fmt.Fprintf(out, "Open this URL in your browser and log in to netcup SCP:\n\n  %s\n\n", uri)
+	// Best-effort terminal output: a failed write must not abort the login.
+	_, _ = fmt.Fprintf(out, "Open this URL in your browser and log in to netcup SCP:\n\n  %s\n\n", uri)
 	if da.VerificationURIComplete == "" && da.UserCode != "" {
-		fmt.Fprintf(out, "When asked, enter the code: %s\n\n", da.UserCode)
+		_, _ = fmt.Fprintf(out, "When asked, enter the code: %s\n\n", da.UserCode)
 	}
 	if da.ExpiresIn > 0 {
-		fmt.Fprintf(out, "Waiting for login (link expires in %s)...\n", (time.Duration(da.ExpiresIn) * time.Second).Round(time.Second))
+		_, _ = fmt.Fprintf(out, "Waiting for login (link expires in %s)...\n", (time.Duration(da.ExpiresIn) * time.Second).Round(time.Second))
 	} else {
-		fmt.Fprintln(out, "Waiting for login...")
+		_, _ = fmt.Fprintln(out, "Waiting for login...")
 	}
 
 	interval := time.Duration(da.Interval) * time.Second
