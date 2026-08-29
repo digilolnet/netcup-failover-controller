@@ -17,7 +17,17 @@ tolerations:
   - key: node-role.kubernetes.io/control-plane
     effect: NoSchedule
 
-affinity: {}
+# Spread the replicas across nodes so a single node failure cannot take out
+# both controller pods.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: netcup-failover-controller
 
 resources:
   limits:
@@ -36,3 +46,14 @@ createNamespace: true
 
 # Whether to install the CRD. Set to false if you manage CRDs separately.
 installCRD: true
+
+# Restrict the controller's pod traffic: egress DNS + TCP 443/6443 only,
+# ingress health probes only. No-op without a NetworkPolicy-enforcing CNI.
+networkPolicy:
+  enabled: true
+
+# Deny kubelets changing their own node's netcup.digilol.net/server-name
+# annotation (ValidatingAdmissionPolicy, requires Kubernetes 1.30+). Disable
+# on older clusters.
+nodeAnnotationProtection:
+  enabled: true

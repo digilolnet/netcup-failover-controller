@@ -1,0 +1,33 @@
+{{- if .Values.networkPolicy.enabled }}
+# Egress is limited to DNS plus TCP 443/6443 (Kubernetes API and the netcup
+# SCP API; the SCP endpoint has no stable CIDR to pin). Ingress is limited to
+# the health probe port. No-op on clusters whose CNI does not enforce
+# NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "netcup-failover-controller.name" . }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "netcup-failover-controller.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "netcup-failover-controller.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - ports:
+        - port: 8081
+          protocol: TCP
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 443
+          protocol: TCP
+        - port: 6443
+          protocol: TCP
+{{- end }}
