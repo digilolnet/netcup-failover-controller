@@ -1,0 +1,35 @@
+# Optional hardening, requires Kubernetes 1.30+.
+#
+# Kubelets may modify their own Node's annotations (the NodeRestriction
+# admission plugin does not cover annotations), so a compromised node could
+# rewrite netcup.digilol.net/server-name and hijack failover IP routing to a
+# different server in the account. This policy denies node users changing the
+# annotation; admins remain unaffected.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: netcup-failover-controller-protect-server-name
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: [v1]
+        operations: [UPDATE]
+        resources: [nodes]
+  matchConditions:
+    - name: request-from-node
+      expression: request.userInfo.groups.exists(g, g == 'system:nodes')
+  validations:
+    - expression: >-
+        object.metadata.?annotations['netcup.digilol.net/server-name'].orValue('') ==
+        oldObject.metadata.?annotations['netcup.digilol.net/server-name'].orValue('')
+      message: nodes may not change their own netcup.digilol.net/server-name annotation
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: netcup-failover-controller-protect-server-name
+spec:
+  policyName: netcup-failover-controller-protect-server-name
+  validationActions: [Deny]

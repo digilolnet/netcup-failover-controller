@@ -15,9 +15,6 @@ rules:
     resources: [nodes]
     verbs: [get, list, watch]
   - apiGroups: [""]
-    resources: [secrets]
-    verbs: [get]
-  - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]
   - apiGroups: [coordination.k8s.io]
@@ -34,6 +31,41 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: {{ include "netcup-failover-controller.name" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "netcup-failover-controller.name" . }}
+    namespace: {{ .Values.namespace }}
+---
+# Secret access is deliberately namespaced, not cluster-wide: the controller
+# only reads/writes credentials Secrets in its own namespace, and the
+# reconciler rejects credentialsSecret references pointing anywhere else.
+#
+# get:    read the OAuth token
+# update: persist refreshed OAuth tokens back to the Secret
+# create: `/manager login` run in-cluster (kubectl exec) bootstraps the Secret
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "netcup-failover-controller.name" . }}-secrets
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "netcup-failover-controller.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "netcup-failover-controller.name" . }}-secrets
+  namespace: {{ .Values.namespace }}
+  labels:
+    {{- include "netcup-failover-controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "netcup-failover-controller.name" . }}-secrets
 subjects:
   - kind: ServiceAccount
     name: {{ include "netcup-failover-controller.name" . }}

@@ -17,7 +17,17 @@ tolerations:
   - key: node-role.kubernetes.io/control-plane
     effect: NoSchedule
 
-affinity: {}
+# Spread the replicas across nodes so a single node failure cannot take out
+# both controller pods.
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: netcup-failover-controller
 
 resources:
   limits:
@@ -26,6 +36,13 @@ resources:
   requests:
     cpu: 10m
     memory: 32Mi
+
+# Optional netcup endpoint overrides (empty = production endpoints).
+# apiUrl: SCP REST API base, default https://www.servercontrolpanel.de/scp-core
+# authUrl: OpenID Connect endpoint base of the SCP Keycloak realm
+netcup:
+  apiUrl: ""
+  authUrl: ""
 
 # Namespace for the controller and its ServiceAccount.
 # NetcupFailoverIP resources are cluster-scoped and can be created in any namespace.
@@ -36,3 +53,14 @@ createNamespace: true
 
 # Whether to install the CRD. Set to false if you manage CRDs separately.
 installCRD: true
+
+# Restrict the controller's pod traffic: egress DNS + TCP 443/6443 only,
+# ingress health probes only. No-op without a NetworkPolicy-enforcing CNI.
+networkPolicy:
+  enabled: true
+
+# Deny kubelets changing their own node's netcup.digilol.net/server-name
+# annotation (ValidatingAdmissionPolicy, requires Kubernetes 1.30+). Disable
+# on older clusters.
+nodeAnnotationProtection:
+  enabled: true
