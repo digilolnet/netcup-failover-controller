@@ -6,14 +6,42 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// ConditionRouted is the single condition type reported on a
+// NetcupFailoverIP: True once every spec IP is routed to CurrentNode.
 const ConditionRouted = "Routed"
+
+// Reasons for the Routed condition.
+const (
+	// ReasonNodeSelected: routing is complete.
+	ReasonNodeSelected = "NodeSelected"
+	// ReasonRouting: a target node was selected and routing is in progress.
+	ReasonRouting = "Routing"
+	// ReasonRateLimited: waiting out the netcup routing rate limit.
+	ReasonRateLimited = "RateLimited"
+	// ReasonRoutingFailed: a routing call or its async task failed.
+	ReasonRoutingFailed = "RoutingFailed"
+	// ReasonCredentialsError: the credentials Secret is missing or invalid.
+	ReasonCredentialsError = "CredentialsError"
+	// ReasonNoEligibleNodes: no healthy node matches the selector.
+	ReasonNoEligibleNodes = "NoEligibleNodes"
+	// ReasonNoAccountNodes: eligible nodes exist, but none carries a
+	// server-name annotation resolving to a server in the netcup account.
+	ReasonNoAccountNodes = "NoAccountNodes"
+	// ReasonInvalidIP: a spec entry is not a valid CIDR.
+	ReasonInvalidIP = "InvalidIP"
+	// ReasonServerLookupError: listing the account's servers failed transiently.
+	ReasonServerLookupError = "ServerLookupError"
+)
 
 type NetcupFailoverIPSpec struct {
 	// IPs is the list of failover IPs in CIDR notation to route together to the same node (e.g. 198.51.100.1/32 or 2001:db8::/64).
 	IPs []string `json:"ips"`
-	// CredentialsSecret references the Secret containing the netcup API credentials.
-	// The Secret must have keys "loginName" and "password".
-	CredentialsSecret corev1.SecretReference `json:"credentialsSecret"`
+	// CredentialsSecret names the Secret containing the netcup SCP API
+	// credentials. The Secret always lives in the controller's own namespace
+	// (its RBAC on Secrets is restricted to it) and must have a "token" key
+	// holding the OAuth2 token JSON; seed it with
+	// `netcup-failover-controller login`.
+	CredentialsSecret corev1.LocalObjectReference `json:"credentialsSecret"`
 	// NodeSelector restricts the set of eligible nodes. Supports the full
 	// Kubernetes label selector syntax (matchLabels and matchExpressions).
 	// If omitted, all ready nodes are eligible.
@@ -21,6 +49,8 @@ type NetcupFailoverIPSpec struct {
 }
 
 type NetcupFailoverIPStatus struct {
+	// CurrentNode is the node the IPs are routed to. While the Routed
+	// condition is False it names the node currently being routed to.
 	CurrentNode string             `json:"currentNode,omitempty"`
 	Conditions  []metav1.Condition `json:"conditions,omitempty"`
 }
@@ -30,7 +60,7 @@ type NetcupFailoverIPStatus struct {
 // deterministically and spreads groups across nodes for bandwidth splitting.
 //
 // +kubebuilder:object:root=true
-// +kubebuilder:resource:scope=Cluster,shortName={}
+// +kubebuilder:resource:scope=Cluster
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=".status.currentNode"
 // +kubebuilder:printcolumn:name="Routed",type=string,JSONPath=".status.conditions[?(@.type==\"Routed\")].status"
@@ -47,10 +77,6 @@ type NetcupFailoverIPList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
 	Items           []NetcupFailoverIP `json:"items"`
-}
-
-func init() {
-	SchemeBuilder.Register(&NetcupFailoverIP{}, &NetcupFailoverIPList{})
 }
 
 // DeepCopy methods — required to satisfy runtime.Object.
