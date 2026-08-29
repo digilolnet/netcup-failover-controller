@@ -1,6 +1,6 @@
 # netcup-failover-controller
 
-A Kubernetes controller that automatically routes [netcup](https://www.netcup.de) failover IPs to healthy cluster nodes via the netcup SOAP API.
+A Kubernetes controller that automatically routes [netcup](https://www.netcup.de) failover IPs to healthy cluster nodes via the netcup SCP REST API (using [go-netcup-scp](https://github.com/digilolnet/go-netcup-scp)).
 
 ## Overview
 
@@ -10,10 +10,10 @@ Multiple `NetcupFailoverIP` resources are spread across different nodes for band
 
 ## How It Works
 
-1. A `NetcupFailoverIP` resource is created with a list of IPs and a reference to a Secret containing netcup credentials.
+1. A `NetcupFailoverIP` resource is created with a list of IPs and a reference to a Secret containing a netcup SCP OAuth token.
 2. The controller lists healthy nodes (optionally filtered by a label selector).
 3. It picks a node deterministically (`hash(resource name) % eligible nodes`), preferring nodes not already hosting another failover IP group.
-4. It fetches the node's MAC address from the netcup SOAP API and calls `ChangeIPRouting` to route each IP there.
+4. It resolves the node's SCP server (via the `netcup.digilol.net/server-name` annotation) and routes each failover IP to it through the SCP REST API, skipping IPs the API already reports as routed there.
 5. Status is updated with the current node and a `Routed` condition.
 6. Node changes trigger re-evaluation for all resources.
 
@@ -101,17 +101,30 @@ kubectl apply -f config/manager/
 
 ## Usage
 
-### 1. Create a credentials Secret
+### 1. Log in (creates the credentials Secret)
 
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: netcup-credentials
-  namespace: netcup-system
-stringData:
-  loginName: "12345"
-  password: "your-netcup-password"
+The controller authenticates against the SCP REST API with an OAuth2 token obtained via the device flow. The `login` subcommand walks you through it and stores the token in the cluster: it prints a URL, you open it in your browser and log in, and the tool picks the token up automatically.
+
+Run it in-cluster through one of the controller pods:
+
+```bash
+kubectl exec -it -n netcup-system deploy/netcup-failover-controller -- /manager login
+```
+
+Or locally with your kubeconfig, if you have the binary:
+
+```bash
+netcup-failover-controller login --secret netcup-system/netcup-credentials
+```
+
+Either way it creates (or updates) the referenced Secret with the token under the `token` key. The controller then writes refreshed tokens back into the Secret, so the one-time login stays valid indefinitely.
+
+Alternatively, seed the Secret from a token file written by the [`netcup-scp` CLI](https://github.com/digilolnet/go-netcup-scp):
+
+```bash
+netcup-scp auth login
+kubectl create secret generic netcup-credentials -n netcup-system \
+  --from-file=token=$HOME/.config/netcup-scp/token.json
 ```
 
 ### 2. Create a NetcupFailoverIP resource
@@ -129,8 +142,9 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials
-    namespace: netcup-system
 ```
+
+`credentialsSecret` names a Secret in the controller's own namespace (`netcup-system` by default) — the controller's RBAC on Secrets is restricted to that namespace, so there is no namespace field to set.
 
 Route to control-plane nodes only:
 
@@ -145,7 +159,6 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials
-    namespace: netcup-system
   nodeSelector:
     matchLabels:
       node-role.kubernetes.io/control-plane: ""
@@ -189,7 +202,6 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials-account1
-    namespace: netcup-system
 ---
 apiVersion: netcup.digilol.net/v1alpha1
 kind: NetcupFailoverIP
@@ -201,7 +213,23 @@ spec:
     - "2001:db8::2/64"
   credentialsSecret:
     name: netcup-credentials-account2
-    namespace: netcup-system
+```
+
+## Security
+
+- **Least-privilege RBAC** — Secret access (`get`/`create`/`update`) is a namespaced Role limited to the controller's namespace, matched by an in-controller check on `credentialsSecret`; cluster-wide the controller can only read nodes and its own CRD. A compromised controller cannot read or overwrite Secrets of other workloads.
+- **Hardened pods** — distroless nonroot image, read-only root filesystem, all capabilities dropped, `RuntimeDefault` seccomp, no privilege escalation, pod anti-affinity across nodes.
+- **NetworkPolicy** (`networkPolicy.enabled`, default on) — egress limited to DNS and TCP 443/6443, ingress to health probes; the metrics server is disabled entirely.
+- **Node annotation protection** (`nodeAnnotationProtection.enabled`, default on, requires Kubernetes 1.30+) — a `ValidatingAdmissionPolicy` prevents kubelets from changing their own node's `netcup.digilol.net/server-name` annotation, so a compromised node cannot redirect failover IPs to another server.
+- **No long-lived passwords** — OAuth2 device flow only; the token lives in a Secret and rotations are persisted automatically.
+- **CI/supply chain** — `govulncheck` and `gosec` gate every PR, dependencies are updated by Dependabot, GitHub Actions are pinned to commit SHAs, and release images are signed with cosign (keyless) and published with provenance and SBOM attestations.
+
+Verify a release image:
+
+```bash
+cosign verify ghcr.io/digilolnet/netcup-failover-controller:<tag> \
+  --certificate-identity-regexp 'https://github.com/digilolnet/netcup-failover-controller/.*' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 ## Development

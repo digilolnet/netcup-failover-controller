@@ -1,14 +1,12 @@
+// Package controller reconciles NetcupFailoverIP resources: it selects a
+// healthy node per group and drives the netcup SCP API (via internal/netcup)
+// until every failover IP is routed to that node's server.
 package controller
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
-	"log/slog"
-	"net"
-	"sort"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,8 +15,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	netcupv1alpha1 "github.com/digilolnet/netcup-failover-controller/api/v1alpha1"
@@ -26,28 +26,30 @@ import (
 )
 
 const (
+	// annotationServerName names the SCP server backing a node.
 	annotationServerName = "netcup.digilol.net/server-name"
-	retryCount           = 10
-	rateLimitMsg         = "Routing a failover IP is only permitted once every 5 minutes."
-	rateLimitRequeue     = 5 * time.Minute
+	// rateLimitRequeue matches the netcup failover routing rate-limit window
+	// (10 requests per 5 minutes).
+	rateLimitRequeue = 5 * time.Minute
 )
 
 type FailoverIPReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	SOAP          netcup.SOAPAPI
-	RetryInterval time.Duration
+	Scheme *runtime.Scheme
+	// Connect opens an authenticated netcup SCP session; tests swap it for a
+	// stub returning a mock API.
+	Connect func(tokenJSON []byte, onRefresh func(tokenJSON []byte)) (*netcup.Session, error)
+	// CredentialsNamespace is the namespace credentials Secrets live in —
+	// the controller's own, matching the namespaced Role it holds on Secrets.
+	CredentialsNamespace string
 }
 
 func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
 	var fip netcupv1alpha1.NetcupFailoverIP
 	if err := r.Get(ctx, req.NamespacedName, &fip); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	loginName, password, err := r.readCredentials(ctx, fip.Spec.CredentialsSecret)
-	if err != nil {
-		return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionFalse, "CredentialsError", err.Error())
 	}
 
 	nodes, err := r.eligibleNodes(ctx, fip.Spec.NodeSelector)
@@ -55,134 +57,131 @@ func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 	if len(nodes) == 0 {
+		// Node events re-enqueue all resources, so a node becoming ready
+		// triggers a new reconcile; no requeue needed.
 		return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionFalse,
-			"NoEligibleNodes", "no healthy nodes match selector")
+			netcupv1alpha1.ReasonNoEligibleNodes, "no healthy nodes match selector")
 	}
 
-	// Stay on the current node as long as it remains healthy and eligible.
-	// Only re-route when the node actually fails or leaves the eligible set.
-	for _, n := range nodes {
-		if n.Name == fip.Status.CurrentNode {
-			return ctrl.Result{}, nil
-		}
+	// Stay on the current node as long as it remains healthy and eligible,
+	// routing is complete, and the spec has not changed since.
+	currentEligible := nodeByName(nodes, fip.Status.CurrentNode).Name != ""
+	if currentEligible && isRouted(&fip) {
+		return ctrl.Result{}, nil
 	}
 
-	occupied, err := r.occupiedNodes(ctx, &fip)
+	routes, err := netcup.ParseRoutes(fip.Spec.IPs)
 	if err != nil {
-		return ctrl.Result{}, err
-	}
-
-	node := selectNode(fip.Name, nodes, occupied)
-
-	serverName, ok := node.Annotations[annotationServerName]
-	if !ok || serverName == "" {
+		// A spec problem: retrying cannot help. The user fixing the spec bumps
+		// the generation and triggers a new reconcile.
 		return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionFalse,
-			"MissingAnnotation", fmt.Sprintf("node %s missing annotation %s", node.Name, annotationServerName))
+			netcupv1alpha1.ReasonInvalidIP, err.Error())
 	}
 
-	info, err := r.SOAP.GetServerInfo(ctx, loginName, password, serverName)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("getting server info for %s: %w", serverName, err)
-	}
-
-	slog.Info("routing failover IPs", "ips", fip.Spec.IPs, "node", node.Name, "server", serverName)
-
-	for _, cidr := range fip.Spec.IPs {
-		ip, netmask, err := parseCIDR(cidr)
+	node := nodeByName(nodes, fip.Status.CurrentNode)
+	if !currentEligible {
+		occupied, err := r.occupiedNodes(ctx, &fip)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := r.routeWithRetry(ctx, loginName, password, ip, netmask, serverName, info.MAC); err != nil {
-			if errors.Is(err, errRateLimit) {
-				slog.Warn("rate limited, requeuing", "ip", ip, "requeue", rateLimitRequeue)
-				return ctrl.Result{RequeueAfter: rateLimitRequeue}, nil
-			}
-			return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionFalse, "RoutingFailed", err.Error())
+		node = selectNode(fip.Name, nodes, occupied)
+	}
+
+	serverName := node.Annotations[annotationServerName]
+	if serverName == "" {
+		// Annotating the node triggers a node event, which re-enqueues us.
+		return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionFalse,
+			netcupv1alpha1.ReasonMissingAnnotation,
+			fmt.Sprintf("node %s missing annotation %s", node.Name, annotationServerName))
+	}
+
+	session, err := r.connect(ctx, fip.Spec.CredentialsSecret.Name)
+	if err != nil {
+		// Secrets are not watched, so return the error to retry with backoff.
+		return ctrl.Result{}, errors.Join(err, r.setCondition(ctx, &fip, metav1.ConditionFalse,
+			netcupv1alpha1.ReasonCredentialsError, err.Error()))
+	}
+	defer session.Close()
+
+	serverID, err := session.ServerIDByName(ctx, serverName)
+	if err != nil {
+		if errors.Is(err, netcup.ErrServerNotFound) {
+			// A wrong annotation: fixing it triggers a node event.
+			return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionFalse,
+				netcupv1alpha1.ReasonServerNotFound, err.Error())
+		}
+		return ctrl.Result{}, errors.Join(err, r.setCondition(ctx, &fip, metav1.ConditionFalse,
+			netcupv1alpha1.ReasonServerLookupError, err.Error()))
+	}
+
+	// Record the target before routing so occupiedNodes spreads other groups
+	// correctly during the transition and requeues keep the same target.
+	if fip.Status.CurrentNode != node.Name {
+		fip.Status.CurrentNode = node.Name
+		if err := r.setCondition(ctx, &fip, metav1.ConditionFalse,
+			netcupv1alpha1.ReasonRouting, fmt.Sprintf("routing to node %s", node.Name)); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
-	return ctrl.Result{}, r.setRoutedCondition(ctx, &fip, node.Name)
+	log.Info("routing failover IPs", "ips", fip.Spec.IPs, "node", node.Name, "server", serverName, "serverID", serverID)
+
+	if err := session.EnsureRouted(ctx, routes, serverID); err != nil {
+		if netcup.IsRateLimited(err) {
+			log.Info("netcup rate limit hit, requeueing", "requeue", rateLimitRequeue)
+			return ctrl.Result{RequeueAfter: rateLimitRequeue}, r.setCondition(ctx, &fip, metav1.ConditionFalse,
+				netcupv1alpha1.ReasonRateLimited, "waiting out the netcup failover routing rate limit")
+		}
+		return ctrl.Result{}, errors.Join(err, r.setCondition(ctx, &fip, metav1.ConditionFalse,
+			netcupv1alpha1.ReasonRoutingFailed, err.Error()))
+	}
+
+	return ctrl.Result{}, r.setCondition(ctx, &fip, metav1.ConditionTrue,
+		netcupv1alpha1.ReasonNodeSelected, fmt.Sprintf("routed to node %s", node.Name))
 }
 
-func (r *FailoverIPReconciler) readCredentials(ctx context.Context, ref corev1.SecretReference) (loginName, password string, err error) {
+// isRouted reports whether routing completed for the current spec generation.
+func isRouted(fip *netcupv1alpha1.NetcupFailoverIP) bool {
+	cond := meta.FindStatusCondition(fip.Status.Conditions, netcupv1alpha1.ConditionRouted)
+	return cond != nil && cond.Status == metav1.ConditionTrue && cond.ObservedGeneration == fip.Generation
+}
+
+// connect reads the OAuth token from the named credentials Secret in the
+// controller's namespace and opens an SCP session. Refreshed tokens are
+// written back to the Secret so the stored refresh token never expires from
+// disuse.
+func (r *FailoverIPReconciler) connect(ctx context.Context, name string) (*netcup.Session, error) {
 	var secret corev1.Secret
-	if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace}, &secret); err != nil {
-		return "", "", fmt.Errorf("reading credentials secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: r.CredentialsNamespace, Name: name}, &secret); err != nil {
+		return nil, fmt.Errorf("reading credentials secret %s/%s: %w", r.CredentialsNamespace, name, err)
 	}
-	loginName = string(secret.Data["loginName"])
-	password = string(secret.Data["password"])
-	if loginName == "" {
-		return "", "", fmt.Errorf("credentials secret %s/%s missing key loginName", ref.Namespace, ref.Name)
+	tokenJSON := secret.Data[netcup.TokenSecretKey]
+	if len(tokenJSON) == 0 {
+		return nil, fmt.Errorf("credentials secret %s/%s missing key %q (seed it with `netcup-failover-controller login --secret %s/%s`)",
+			r.CredentialsNamespace, name, netcup.TokenSecretKey, r.CredentialsNamespace, name)
 	}
-	if password == "" {
-		return "", "", fmt.Errorf("credentials secret %s/%s missing key password", ref.Namespace, ref.Name)
-	}
-	return loginName, password, nil
+	return r.Connect(tokenJSON, func(refreshed []byte) {
+		r.persistToken(ctx, name, refreshed)
+	})
 }
 
-func (r *FailoverIPReconciler) eligibleNodes(ctx context.Context, selector *metav1.LabelSelector) ([]corev1.Node, error) {
-	listOpts := []client.ListOption{}
-	if selector != nil {
-		sel, err := metav1.LabelSelectorAsSelector(selector)
-		if err != nil {
-			return nil, fmt.Errorf("invalid nodeSelector: %w", err)
-		}
-		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: sel})
+// persistToken stores a refreshed OAuth token back into the credentials
+// Secret. Failures are logged, not returned: the reconcile that triggered the
+// refresh still holds a valid access token and should proceed.
+func (r *FailoverIPReconciler) persistToken(ctx context.Context, name string, tokenJSON []byte) {
+	log := logf.FromContext(ctx)
+	var secret corev1.Secret
+	if err := r.Get(ctx, types.NamespacedName{Namespace: r.CredentialsNamespace, Name: name}, &secret); err != nil {
+		log.Error(err, "reading credentials secret to persist refreshed token", "secret", name)
+		return
 	}
-
-	var nodeList corev1.NodeList
-	if err := r.List(ctx, &nodeList, listOpts...); err != nil {
-		return nil, err
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
 	}
-
-	var eligible []corev1.Node
-	for _, node := range nodeList.Items {
-		if isNodeReady(&node) {
-			eligible = append(eligible, node)
-		}
+	secret.Data[netcup.TokenSecretKey] = tokenJSON
+	if err := r.Update(ctx, &secret); err != nil {
+		log.Error(err, "persisting refreshed token to credentials secret", "secret", name)
 	}
-	return eligible, nil
-}
-
-func (r *FailoverIPReconciler) occupiedNodes(ctx context.Context, current *netcupv1alpha1.NetcupFailoverIP) (map[string]bool, error) {
-	var list netcupv1alpha1.NetcupFailoverIPList
-	if err := r.List(ctx, &list); err != nil {
-		return nil, err
-	}
-	occupied := make(map[string]bool)
-	for _, fip := range list.Items {
-		if fip.Name == current.Name {
-			continue
-		}
-		if fip.Status.CurrentNode != "" {
-			occupied[fip.Status.CurrentNode] = true
-		}
-	}
-	return occupied, nil
-}
-
-var errRateLimit = fmt.Errorf("netcup rate limit: %s", rateLimitMsg)
-
-func (r *FailoverIPReconciler) routeWithRetry(ctx context.Context, loginName, password, ip, netmask, serverName, mac string) error {
-	var lastErr error
-	for i := range retryCount {
-		lastErr = r.SOAP.ChangeIPRouting(ctx, loginName, password, ip, netmask, serverName, mac)
-		if lastErr == nil {
-			return nil
-		}
-		if strings.Contains(lastErr.Error(), rateLimitMsg) {
-			return errRateLimit
-		}
-		if i < retryCount-1 {
-			slog.Warn("ChangeIPRouting failed, retrying", "attempt", i+1, "err", lastErr)
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(r.RetryInterval):
-			}
-		}
-	}
-	return fmt.Errorf("routing %s after %d attempts: %w", ip, retryCount, lastErr)
 }
 
 func (r *FailoverIPReconciler) setCondition(ctx context.Context, fip *netcupv1alpha1.NetcupFailoverIP, status metav1.ConditionStatus, reason, message string) error {
@@ -196,24 +195,13 @@ func (r *FailoverIPReconciler) setCondition(ctx context.Context, fip *netcupv1al
 	return r.Status().Update(ctx, fip)
 }
 
-func (r *FailoverIPReconciler) setRoutedCondition(ctx context.Context, fip *netcupv1alpha1.NetcupFailoverIP, nodeName string) error {
-	fip.Status.CurrentNode = nodeName
-	meta.SetStatusCondition(&fip.Status.Conditions, metav1.Condition{
-		Type:               netcupv1alpha1.ConditionRouted,
-		Status:             metav1.ConditionTrue,
-		Reason:             "NodeSelected",
-		Message:            fmt.Sprintf("routed to node %s", nodeName),
-		ObservedGeneration: fip.Generation,
-	})
-	return r.Status().Update(ctx, fip)
-}
-
 func (r *FailoverIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&netcupv1alpha1.NetcupFailoverIP{}).
 		Watches(
 			&corev1.Node{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueAll),
+			builder.WithPredicates(nodePredicate()),
 		).
 		Complete(r)
 }
@@ -221,6 +209,7 @@ func (r *FailoverIPReconciler) SetupWithManager(mgr ctrl.Manager) error {
 func (r *FailoverIPReconciler) enqueueAll(ctx context.Context, _ client.Object) []reconcile.Request {
 	var list netcupv1alpha1.NetcupFailoverIPList
 	if err := r.List(ctx, &list); err != nil {
+		logf.FromContext(ctx).Error(err, "listing NetcupFailoverIPs for node event")
 		return nil
 	}
 	reqs := make([]reconcile.Request, len(list.Items))
@@ -228,43 +217,4 @@ func (r *FailoverIPReconciler) enqueueAll(ctx context.Context, _ client.Object) 
 		reqs[i] = reconcile.Request{NamespacedName: types.NamespacedName{Name: item.Name}}
 	}
 	return reqs
-}
-
-// selectNode picks a node deterministically, preferring nodes not already
-// hosting another failover IP group.
-func selectNode(name string, nodes []corev1.Node, occupied map[string]bool) corev1.Node {
-	sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
-
-	var free []corev1.Node
-	for _, n := range nodes {
-		if !occupied[n.Name] {
-			free = append(free, n)
-		}
-	}
-	pool := nodes
-	if len(free) > 0 {
-		pool = free
-	}
-
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(name))
-	return pool[h.Sum32()%uint32(len(pool))]
-}
-
-func isNodeReady(node *corev1.Node) bool {
-	for _, cond := range node.Status.Conditions {
-		if cond.Type == corev1.NodeReady && cond.Status == corev1.ConditionTrue {
-			return true
-		}
-	}
-	return false
-}
-
-func parseCIDR(cidr string) (ip, mask string, err error) {
-	addr, network, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return "", "", fmt.Errorf("invalid CIDR %q: %w", cidr, err)
-	}
-	ones, _ := network.Mask.Size()
-	return addr.String(), fmt.Sprintf("%d", ones), nil
 }

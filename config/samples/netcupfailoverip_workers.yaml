@@ -8,7 +8,6 @@ spec:
     - "2001:db8::/64"
   credentialsSecret:
     name: netcup-credentials
-    namespace: netcup-system
   nodeSelector:
     matchExpressions:
       - key: node-role.kubernetes.io/control-plane
