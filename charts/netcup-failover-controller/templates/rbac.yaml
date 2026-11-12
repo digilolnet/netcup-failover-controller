@@ -30,6 +30,37 @@ subjects:
     name: {{ include "netcup-failover-controller.name" . }}
     namespace: {{ .Values.namespace }}
 ---
+# Events about NetcupFailoverIP resources. Events on cluster-scoped objects
+# are stored in the default namespace, so the grant is a Role there instead
+# of cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "netcup-failover-controller.name" . }}-events
+  namespace: default
+  labels:
+    {{- include "netcup-failover-controller.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "netcup-failover-controller.name" . }}-events
+  namespace: default
+  labels:
+    {{- include "netcup-failover-controller.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "netcup-failover-controller.name" . }}-events
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "netcup-failover-controller.name" . }}
+    namespace: {{ .Values.namespace }}
+---
 # Secret access is deliberately namespaced, not cluster-wide: the controller
 # only reads/writes credentials Secrets in its own namespace, and the
 # reconciler rejects credentialsSecret references pointing anywhere else.

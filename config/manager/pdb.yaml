@@ -1,0 +1,11 @@
+# Keep a node drain from evicting both replicas at once.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: netcup-failover-controller
+  namespace: netcup-system
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: netcup-failover-controller

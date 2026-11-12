@@ -126,6 +126,7 @@ func main() {
 		Connect:              netcup.ConfigFromEnv().Connect,
 		CredentialsNamespace: namespace,
 		ResyncInterval:       resync,
+		Recorder:             mgr.GetEventRecorder("netcup-failover-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		ctrl.Log.Error(err, "failed to setup controller")
 		os.Exit(1)

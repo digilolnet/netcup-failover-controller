@@ -20,13 +20,13 @@ Multiple `NetcupFailoverIP` resources are spread across different nodes for band
 
 ### What `Routed=True` means
 
-`Routed=True` means netcup routes the group's IPs to the server of `status.currentNode`. It does **not** mean the node answers on those addresses: the controller never configures or probes them. A node that is `Ready` but cannot serve the address (address missing, or disabled by duplicate address detection, see below) is still a valid target, and the resource will show `Routed=True` while the address is unreachable. Monitor the failover addresses from outside the cluster.
+`Routed=True` means netcup routes the group's IPs to the server of `status.currentNode`. It does **not** mean the node answers on those addresses: the controller never configures or probes them. A node that is `Ready` but cannot serve the address (see [Node Network Configuration](#node-network-configuration)) is still a valid target, and the resource will show `Routed=True` while the address is unreachable. Monitor the failover addresses from outside the cluster.
 
 A node counts as healthy when its `Ready` condition is true, so a hard crash is only acted on once Kubernetes marks the node `NotReady`.
 
 netcup rate-limits failover routing (10 requests per 5 minutes). When the limit is hit the controller records a `RateLimited` condition and retries after 5 minutes — IPs that already routed are never re-routed, so a large group converges across windows.
 
-The controller runs with two replicas and leader election — one active, one standby.
+The controller runs with two replicas and leader election — one active, one standby. A pod that shuts down cleanly hands the lease over at once. If the active pod dies with its node, the standby takes over when the lease expires, about 15 seconds later (controller-runtime's defaults). That runs in parallel with Kubernetes noticing the dead node, which takes longer by default, so it should not add to the failover time; this case has not been tested.
 
 ## Prerequisites
 
@@ -38,51 +38,11 @@ The controller runs with two replicas and leader election — one active, one st
 
 ## Node Network Configuration
 
-The controller routes traffic to a node at the netcup network level, but the node's OS must also have the failover IPs configured on its network interface — otherwise the kernel will drop incoming packets.
+The controller routes traffic to a node at the netcup network level. It does not configure addresses: every eligible node (not just the current holder) must carry the failover addresses itself, so that it can answer the moment routing switches to it.
 
-Configure the failover IPs on **all eligible nodes** (not just the currently active one), so that when a failover switches routing to a different node, that node is immediately ready to accept packets.
+### Recommended: failover addresses on loopback
 
-### IPv4
-
-Add the failover IP as an additional address on the node's interface:
-
-```yaml
-# patch.yaml
-machine:
-  network:
-    interfaces:
-      - interface: <interface-name> # e.g. eth0, ens3
-        addresses:
-          - 198.51.100.1/32
-```
-
-### IPv6 /64
-
-Two addresses are required on the interface:
-
-1. **The failover /64 prefix** — so the kernel accepts packets destined anywhere in the range.
-2. **The node's EUI-64 host address** — netcup's router uses this as the next-hop when forwarding packets for the /64. Without it the router's NDP goes unanswered and no traffic arrives.
-
-The EUI-64 host address is derived from the interface MAC address. If your cluster provisioning tool configures the native IPv6 as `2001:db8:1:2::/64` (the `::` network address), you need to also add the EUI-64 host address explicitly.
-
-Derive it from the link-local address: if the link-local is `fe80::a8bb:ccff:fedd:eeff`, the global EUI-64 address in the native /64 is `2001:db8:1:2:a8bb:ccff:fedd:eeff`.
-
-```yaml
-# patch.yaml
-machine:
-  network:
-    interfaces:
-      - interface: <interface-name>
-        addresses:
-          - 2001:db8::/64 # the failover /64
-          - 2001:db8:1:2:a8bb:ccff:fedd:eeff/64 # native EUI-64 host address
-```
-
-### Nodes on a shared segment: use loopback for IPv6
-
-If the eligible nodes share a layer-2 segment and all carry the same failover IPv6 address on their public interface, the kernel's duplicate address detection (DAD) on one node can see another node's copy and disable its own. `ip -6 addr` then shows the address as `dadfailed`, and which node loses depends on boot timing. When the controller routes the prefix to that node, the address is unreachable although the resource reports `Routed=True`.
-
-Avoid this by putting the failover IPv6 addresses you serve on the loopback interface as `/128`s, where DAD does not run. netcup routes the prefix to the server, so the addresses do not need to be on the public interface. (This was confirmed by a manual test on one node, not yet by a full failover.)
+Put the failover addresses of both families on `lo`, and nothing failover-related on the public interface:
 
 ```yaml
 # patch.yaml
@@ -91,10 +51,44 @@ machine:
     interfaces:
       - interface: lo
         addresses:
-          - 2001:db8::1/128 # each failover IPv6 address the node serves
+          - 198.51.100.1/32 # IPv4 failover
+          - 2001:db8::1/128 # each IPv6 failover address the node serves
 ```
 
-Alternatively keep the address on the public interface but add it with DAD disabled (`ip -6 addr add … nodad`). IPv4 `/32` failover addresses are not affected.
+netcup routes the failover IPs to the server, so they do not have to be on the public interface, and a single `/128` is enough for IPv6: the failover `/64` itself is not needed anywhere.
+
+This layout was tested on three Talos control planes sharing one netcup segment. Both families answered from outside on the holder, and a clean reboot of the IPv6 holder re-routed the prefix in about 2 seconds with no failed probe out of 183 over three minutes. A failover of the IPv4 group in this layout and a hard crash of the holder have not been tested.
+
+### The node's EUI-64 address must stay on the public interface
+
+netcup's routers use the node's native EUI-64 address as the next hop for a failover IPv6 prefix. It has to be configured on the public interface, in addition to whatever native address the node otherwise uses:
+
+```yaml
+# patch.yaml
+machine:
+  network:
+    interfaces:
+      - interface: <interface-name> # e.g. eth0, ens3
+        addresses:
+          - 2001:db8:1:2:a8bb:ccff:fedd:eeff/64 # native EUI-64 host address
+```
+
+Derive it from the link-local address: if the link-local is `fe80::a8bb:ccff:fedd:eeff`, the EUI-64 address in the native prefix `2001:db8:1:2::/64` is `2001:db8:1:2:a8bb:ccff:fedd:eeff`.
+
+> **A missing EUI-64 address does not fail immediately.** The routers keep forwarding on their cached neighbour entry, so a quick test passes. In one test the failover kept working for about 7 minutes after the address was removed; then a router's neighbour solicitations went unanswered and 22 of 50 outside probes failed until the address was restored.
+
+The EUI-64 address is only needed as the failover next hop. The node's other native addresses (for example `::1`) are resolved individually by the routers and work without it.
+
+### Why not the public interface
+
+Earlier versions of this README put the failover `/64` on the public interface. That has two problems for IPv6 when the eligible nodes share a layer-2 segment, as netcup servers commonly do:
+
+- **Duplicate address detection.** Every node carries the same address on the same segment, so the kernel on one node can see another node's copy and disable its own. `ip -6 addr` then shows the address as `dadfailed`, and which node loses depends on boot timing. When the controller routes the prefix to that node, the address is unreachable although the resource reports `Routed=True`.
+- **Outbound source address.** The kernel may choose a failover address as the source for destinations whose prefix is closer to the failover range than to the node's own. Replies go to whichever node holds the prefix, so outbound IPv6 to those destinations fails on every other node. On `lo` this does not happen, because the kernel prefers addresses on the outgoing interface.
+
+If you followed the earlier layout, both problems are latent in your cluster; move the addresses to `lo`. If the address must stay on the public interface, add it with duplicate detection disabled (`ip -6 addr add … nodad`), which avoids only the first problem.
+
+IPv4 `/32` failover addresses are affected by neither, so moving them to `lo` is for consistency.
 
 ### Keeping a node out of rotation
 
@@ -227,11 +221,32 @@ secondary   k8s-control-plane-2    True     5m
 
 ## Drift check
 
-A routed group is otherwise left alone until its spec or a node changes. So that a change made elsewhere (the SCP panel, another tool) does not go unnoticed, the controller periodically lists the account's failover IPs and compares them with `status.currentNode`. If they differ it logs the affected IPs and routes them back. The check only reads, so it does not use up the routing rate limit; a re-route does.
+A routed group is otherwise left alone until its spec or a node changes. So that a change made elsewhere (the SCP panel, another tool) does not go unnoticed, the controller periodically lists the account's failover IPs and compares them with `status.currentNode`. If they differ it logs the affected IPs and routes them back. The check only reads, so it does not use up the routing rate limit; a re-route does. In a test, a prefix moved to another server through the SCP API was detected at the next check and routed back within 2 seconds.
 
 The interval defaults to 5 minutes. Set the Helm value `resyncInterval` (or the `RESYNC_INTERVAL` environment variable) to a Go duration such as `10m`, or to `0` to disable the check.
 
-If the check itself fails (netcup API unavailable, credentials rejected), the `Routed` condition is left as it is and the check is retried with backoff; the failure appears in the controller log only.
+`status.lastVerifiedTime` records when netcup's routing was last confirmed (shown as the `VERIFIED` column of `kubectl get netcupfailoverips -o wide`).
+
+If the check itself fails (netcup API unavailable, credentials rejected), the `Routed` condition is left as it is, because the failure says nothing about where the IPs are routed. Instead a second condition, `Verified`, turns `False` with the reason, and the check is retried with backoff. `Routed=True` together with `Verified=False` therefore means "routed when last seen, but netcup cannot currently be asked" — a state in which a failover would also fail, so alert on it.
+
+## Events
+
+The controller records Kubernetes Events on the resource, so its actions outlive the pod log:
+
+| Type | Reason | When |
+| --- | --- | --- |
+| Normal | `Routed` | The group was routed to a node (first placement, failover, or drift repair) |
+| Warning | `DriftDetected` | netcup routed the IPs elsewhere than the status said |
+| Warning | `RateLimited` | The routing rate limit was hit; retried after 5 minutes |
+| Warning | `RoutingFailed`, `CredentialsError`, `ServerLookupError`, `VerificationFailed` | A routing attempt or drift check failed; retried with backoff |
+| Warning | `NoEligibleNodes`, `NoAccountNodes`, `InvalidIP`, `InvalidNodeSelector` | The group cannot be placed until the nodes or the spec change |
+
+`NetcupFailoverIP` is cluster-scoped, and Kubernetes stores events for cluster-scoped objects in the `default` namespace:
+
+```bash
+kubectl describe netcupfailoverip primary
+kubectl get events -n default --field-selector involvedObject.kind=NetcupFailoverIP
+```
 
 ## Multiple IP Groups
 

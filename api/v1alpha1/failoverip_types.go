@@ -6,9 +6,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
-// ConditionRouted is the single condition type reported on a
-// NetcupFailoverIP: True once every spec IP is routed to CurrentNode.
-const ConditionRouted = "Routed"
+// Condition types reported on a NetcupFailoverIP.
+const (
+	// ConditionRouted is True once netcup routes every spec IP to
+	// CurrentNode. It says nothing about the node answering on the addresses.
+	ConditionRouted = "Routed"
+	// ConditionVerified reports the most recent comparison of the Routed
+	// condition against netcup's actual routing: True if netcup could be
+	// asked and agreed (or was corrected), False if it could not be asked, so
+	// Routed may be stale. It is absent while Routed is not True.
+	ConditionVerified = "Verified"
+)
 
 // Reasons for the Routed condition.
 const (
@@ -33,6 +41,25 @@ const (
 	ReasonInvalidNodeSelector = "InvalidNodeSelector"
 	// ReasonServerLookupError: listing the account's servers failed transiently.
 	ReasonServerLookupError = "ServerLookupError"
+)
+
+// Reasons for the Verified condition. A failed check also uses
+// ReasonCredentialsError and ReasonServerLookupError.
+const (
+	// ReasonRoutingConfirmed: netcup's routing matched the status, or was
+	// just made to.
+	ReasonRoutingConfirmed = "RoutingConfirmed"
+	// ReasonVerificationFailed: listing the account's failover IPs failed.
+	ReasonVerificationFailed = "VerificationFailed"
+)
+
+// Event reasons that are not also condition reasons.
+const (
+	// EventReasonRouted: the group was routed to a node.
+	EventReasonRouted = "Routed"
+	// EventReasonDriftDetected: netcup routed the IPs elsewhere than the
+	// status said, and the controller is routing them back.
+	EventReasonDriftDetected = "DriftDetected"
 )
 
 // NetcupFailoverIPSpec is the desired state of a NetcupFailoverIP.
@@ -66,7 +93,13 @@ type NetcupFailoverIPStatus struct {
 	//
 	// +optional
 	CurrentNode string `json:"currentNode,omitempty"`
-	// Conditions holds the Routed condition (see ConditionRouted).
+	// LastVerifiedTime is when netcup's routing was last confirmed to match
+	// CurrentNode, either by routing there or by the periodic drift check.
+	//
+	// +optional
+	LastVerifiedTime *metav1.Time `json:"lastVerifiedTime,omitempty"`
+	// Conditions holds the Routed and Verified conditions (see
+	// ConditionRouted and ConditionVerified).
 	//
 	// +optional
 	// +listType=map
@@ -83,6 +116,7 @@ type NetcupFailoverIPStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Node",type=string,JSONPath=".status.currentNode"
 // +kubebuilder:printcolumn:name="Routed",type=string,JSONPath=".status.conditions[?(@.type==\"Routed\")].status"
+// +kubebuilder:printcolumn:name="Verified",type=date,JSONPath=".status.lastVerifiedTime",priority=1
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 type NetcupFailoverIP struct {
 	metav1.TypeMeta   `json:",inline"`
@@ -141,6 +175,9 @@ func (in *NetcupFailoverIPSpec) DeepCopyInto(out *NetcupFailoverIPSpec) {
 // DeepCopyInto copies the status into out.
 func (in *NetcupFailoverIPStatus) DeepCopyInto(out *NetcupFailoverIPStatus) {
 	*out = *in
+	if in.LastVerifiedTime != nil {
+		out.LastVerifiedTime = in.LastVerifiedTime.DeepCopy()
+	}
 	if in.Conditions != nil {
 		out.Conditions = make([]metav1.Condition, len(in.Conditions))
 		for i := range in.Conditions {

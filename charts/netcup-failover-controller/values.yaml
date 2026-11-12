@@ -7,6 +7,16 @@ replicaCount: 2
 
 podAnnotations: {}
 
+# The controller often carries the address of the cluster's API endpoint, so
+# by default it is not evicted under node pressure. Empty for no priority
+# class.
+priorityClassName: system-cluster-critical
+
+# Keep a node drain from evicting both replicas at once.
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
 # Node selector and tolerations for the controller pods themselves.
 # Defaults to control-plane nodes, which is recommended since the controller
 # needs to survive worker node failures.
@@ -18,7 +28,10 @@ tolerations:
     effect: NoSchedule
 
 # Spread the replicas across nodes so a single node failure cannot take out
-# both controller pods.
+# both controller pods. This is a preference: to guarantee it, replace
+# preferredDuringSchedulingIgnoredDuringExecution with the required form, but
+# only with at least three eligible nodes, or a rolling update has nowhere to
+# place the new pod and stalls.
 affinity:
   podAntiAffinity:
     preferredDuringSchedulingIgnoredDuringExecution:
