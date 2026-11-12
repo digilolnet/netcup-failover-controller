@@ -2,8 +2,30 @@ apiVersion: v1
 entries:
   netcup-failover-controller:
   - apiVersion: v2
+    appVersion: v1.1.0-rc.3
+    created: "2026-11-12T13:11:28.285005499Z"
+    description: Routes netcup failover IPs to healthy Kubernetes nodes via the netcup
+      SCP REST API.
+    digest: 7e55dbc67731777905c100f64dee2c4f0c76344006fa0fbe6908b8e7ffc8ed3a
+    home: https://github.com/digilolnet/netcup-failover-controller
+    keywords:
+    - netcup
+    - failover
+    - ip
+    - controller
+    maintainers:
+    - name: Digilol
+      url: https://github.com/digilolnet
+    name: netcup-failover-controller
+    sources:
+    - https://github.com/digilolnet/netcup-failover-controller
+    type: application
+    urls:
+    - https://digilolnet.github.io/netcup-failover-controller/netcup-failover-controller-1.1.0-rc.3.tgz
+    version: 1.1.0-rc.3
+  - apiVersion: v2
     appVersion: v1.1.0-rc.2
-    created: "2026-11-12T04:58:53.843938148Z"
+    created: "2026-11-12T13:11:28.284524553Z"
     description: Routes netcup failover IPs to healthy Kubernetes nodes via the netcup
       SCP REST API.
     digest: 2621a6dbb771bba721d258459382c2ea44c69bb50b3cf7263e0ab57c0fa0fd63
@@ -25,7 +47,7 @@ entries:
     version: 1.1.0-rc.2
   - apiVersion: v2
     appVersion: v1.1.0-rc.1
-    created: "2026-11-12T04:58:53.843518405Z"
+    created: "2026-11-12T13:11:28.284031499Z"
     description: Routes netcup failover IPs to healthy Kubernetes nodes via the netcup
       SCP REST API.
     digest: fc513ae7b0dc6c2329074efb419cbad73103a8976efc7b7e9d5558096d2f61ee
@@ -45,4 +67,4 @@ entries:
     urls:
     - https://digilolnet.github.io/netcup-failover-controller/netcup-failover-controller-1.1.0-rc.1.tgz
     version: 1.1.0-rc.1
-generated: "2026-11-12T04:58:53.84284948Z"
+generated: "2026-11-12T13:11:28.283195478Z"
