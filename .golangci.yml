@@ -1,7 +1,31 @@
 version: "2"
 
 linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - intrange
+    - loggercheck # logr key/value pairs
+    - misspell
+    - modernize
+    - nilerr
+    - nolintlint
+    - revive # includes doc comments on exported identifiers
+    - thelper
+    - usetesting
   settings:
     errcheck:
       exclude-functions:
         - (io.Closer).Close
+    modernize:
+      disable:
+        - embedlit # keep explicit embedded-field keys in composite literals
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

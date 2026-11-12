@@ -16,7 +16,7 @@ import (
 	"github.com/digilolnet/netcup-failover-controller/internal/netcup"
 )
 
-type fakeIdP struct {
+type fakeIDP struct {
 	deviceAuth   *auth.DeviceAuthResponse
 	initiateErr  error
 	token        *auth.TokenResponse
@@ -26,12 +26,12 @@ type fakeIdP struct {
 	initiateHits int
 }
 
-func (f *fakeIdP) InitiateDeviceAuth(context.Context) (*auth.DeviceAuthResponse, error) {
+func (f *fakeIDP) InitiateDeviceAuth(context.Context) (*auth.DeviceAuthResponse, error) {
 	f.initiateHits++
 	return f.deviceAuth, f.initiateErr
 }
 
-func (f *fakeIdP) PollForToken(_ context.Context, deviceCode string, interval time.Duration) (*auth.TokenResponse, error) {
+func (f *fakeIDP) PollForToken(_ context.Context, deviceCode string, interval time.Duration) (*auth.TokenResponse, error) {
 	f.polledCode = deviceCode
 	f.polledEvery = interval
 	return f.token, f.pollErr
@@ -40,14 +40,14 @@ func (f *fakeIdP) PollForToken(_ context.Context, deviceCode string, interval ti
 func TestDeviceLogin(t *testing.T) {
 	tests := []struct {
 		name       string
-		idp        *fakeIdP
+		idp        *fakeIDP
 		wantErr    string
 		wantOutput []string
 		wantPoll   time.Duration
 	}{
 		{
 			name: "complete URI shown and token returned",
-			idp: &fakeIdP{
+			idp: &fakeIDP{
 				deviceAuth: &auth.DeviceAuthResponse{
 					DeviceCode:              "dev-1",
 					UserCode:                "ABCD-EFGH",
@@ -63,7 +63,7 @@ func TestDeviceLogin(t *testing.T) {
 		},
 		{
 			name: "falls back to plain URI plus code",
-			idp: &fakeIdP{
+			idp: &fakeIDP{
 				deviceAuth: &auth.DeviceAuthResponse{
 					DeviceCode:      "dev-1",
 					UserCode:        "ABCD-EFGH",
@@ -76,12 +76,12 @@ func TestDeviceLogin(t *testing.T) {
 		},
 		{
 			name:    "initiate fails",
-			idp:     &fakeIdP{initiateErr: errors.New("idp down")},
+			idp:     &fakeIDP{initiateErr: errors.New("idp down")},
 			wantErr: "initiating device authorization",
 		},
 		{
 			name: "poll fails",
-			idp: &fakeIdP{
+			idp: &fakeIDP{
 				deviceAuth: &auth.DeviceAuthResponse{DeviceCode: "dev-1", VerificationURI: "https://idp.example/device"},
 				pollErr:    errors.New("expired_token"),
 			},
@@ -174,17 +174,18 @@ func TestStoreToken_UsesSharedKey(t *testing.T) {
 
 func TestParseSecretRef(t *testing.T) {
 	tests := []struct {
+		name          string
 		ref           string
 		wantNS, wantN string
 		wantErr       bool
 	}{
-		{ref: "netcup-system/netcup-credentials", wantNS: "netcup-system", wantN: "netcup-credentials"},
-		{ref: "no-slash", wantErr: true},
-		{ref: "/name-only", wantErr: true},
-		{ref: "ns-only/", wantErr: true},
+		{name: "valid", ref: "netcup-system/netcup-credentials", wantNS: "netcup-system", wantN: "netcup-credentials"},
+		{name: "no slash", ref: "no-slash", wantErr: true},
+		{name: "empty namespace", ref: "/name-only", wantErr: true},
+		{name: "empty name", ref: "ns-only/", wantErr: true},
 	}
 	for _, tt := range tests {
-		t.Run(tt.ref, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			ns, name, err := parseSecretRef(tt.ref)
 			if tt.wantErr {
 				if err == nil {

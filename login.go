@@ -33,7 +33,7 @@ type deviceAuthorizer interface {
 // with a local kubeconfig or in-cluster (e.g. via `kubectl exec`).
 func runLogin(args []string) error {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	secretRef := fs.String("secret", "netcup-system/netcup-credentials",
+	secretRef := fs.String("secret", controllerNamespace()+"/netcup-credentials",
 		"namespace/name of the Secret to store the OAuth token in")
 	_ = fs.Parse(args) // ExitOnError: Parse never returns a non-nil error
 
@@ -44,16 +44,16 @@ func runLogin(args []string) error {
 
 	ctx := ctrl.SetupSignalHandler()
 
-	cl, err := client.New(ctrl.GetConfigOrDie(), client.Options{})
+	restCfg, err := ctrl.GetConfig()
+	if err != nil {
+		return fmt.Errorf("loading kubeconfig: %w", err)
+	}
+	cl, err := client.New(restCfg, client.Options{})
 	if err != nil {
 		return fmt.Errorf("connecting to the cluster: %w", err)
 	}
 
-	var authOpts []auth.Option
-	if authURL := os.Getenv("NETCUP_SCP_AUTH_URL"); authURL != "" {
-		authOpts = append(authOpts, auth.WithAuthURL(authURL))
-	}
-	mgr := auth.NewManager(authOpts...)
+	mgr := netcup.ConfigFromEnv().AuthManager()
 	defer mgr.Close()
 
 	token, err := deviceLogin(ctx, mgr, os.Stdout)
@@ -98,7 +98,8 @@ func deviceLogin(ctx context.Context, idp deviceAuthorizer, out io.Writer) (*aut
 		_, _ = fmt.Fprintf(out, "When asked, enter the code: %s\n\n", da.UserCode)
 	}
 	if da.ExpiresIn > 0 {
-		_, _ = fmt.Fprintf(out, "Waiting for login (link expires in %s)...\n", (time.Duration(da.ExpiresIn) * time.Second).Round(time.Second))
+		expiresIn := time.Duration(da.ExpiresIn) * time.Second
+		_, _ = fmt.Fprintf(out, "Waiting for login (link expires in %s)...\n", expiresIn)
 	} else {
 		_, _ = fmt.Fprintln(out, "Waiting for login...")
 	}

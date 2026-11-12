@@ -256,7 +256,7 @@ gosec -exclude-dir=agent ./...
 
 The netcup endpoints can be overridden — e.g. for a mock API — via `NETCUP_SCP_API_URL` (SCP REST base) and `NETCUP_SCP_AUTH_URL` (OpenID Connect base), or the `netcup.apiUrl` / `netcup.authUrl` Helm values. Empty means the production endpoints.
 
-The controller also runs out-of-cluster against your kubeconfig — useful for development, since leader election is pinned to the `netcup-system` namespace. Scale the in-cluster deployment to 0 first so it releases the lease:
+The controller also runs out-of-cluster against your kubeconfig — useful for development: the leader-election lease and credentials Secrets are looked up in `netcup-system`, or in `CREDENTIALS_NAMESPACE` if the controller is installed elsewhere. Scale the in-cluster deployment to 0 first so it releases the lease:
 
 ```bash
 kubectl -n netcup-system scale deploy netcup-failover-controller --replicas=0

@@ -2,6 +2,7 @@ package netcup
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -69,7 +70,7 @@ func TestConnect(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			session, err := Connect([]byte(tt.tokenJSON), nil)
+			session, err := Config{}.Connect([]byte(tt.tokenJSON), nil)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 					t.Fatalf("error = %v, want containing %q", err, tt.wantErr)
@@ -121,7 +122,9 @@ func TestConfig_Connect_EndpointOverrides(t *testing.T) {
 	tokenJSON := fmt.Sprintf(`{"access_token":%q,"refresh_token":"r1","expires_in":300}`,
 		fakeJWT(`{"id":"42"}`))
 
-	session, err := Config{APIBaseURL: api.URL, AuthURL: idp.URL}.Connect([]byte(tokenJSON), nil)
+	var persisted []byte
+	onRefresh := func(tokenJSON []byte) { persisted = tokenJSON }
+	session, err := Config{APIBaseURL: api.URL, AuthURL: idp.URL}.Connect([]byte(tokenJSON), onRefresh)
 	if err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
@@ -136,6 +139,21 @@ func TestConfig_Connect_EndpointOverrides(t *testing.T) {
 	}
 	if !refreshed {
 		t.Error("expected the backdated token to be refreshed via the AuthURL override")
+	}
+
+	// The refreshed token must reach onRefresh serialized the way Connect
+	// reads it back, or the Secret would end up holding the stale token.
+	var stored struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := json.Unmarshal(persisted, &stored); err != nil {
+		t.Fatalf("onRefresh payload %q is not token JSON: %v", persisted, err)
+	}
+	if stored.RefreshToken != "r2" {
+		t.Errorf("onRefresh refresh_token = %q, want the rotated r2", stored.RefreshToken)
+	}
+	if _, err := (Config{APIBaseURL: api.URL, AuthURL: idp.URL}).Connect(persisted, nil); err != nil {
+		t.Errorf("onRefresh payload cannot be used to reconnect: %v", err)
 	}
 }
 

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The release workflow calls this one, so nothing is published from a
+  # commit that fails these checks.
+  workflow_call:
 
 permissions:
   contents: read
@@ -26,8 +29,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: go.mod is tidy
+        run: go mod tidy -diff
+
       - name: Test
-        run: go test -race ./...
+        run: go test -race -shuffle=on ./...
 
   lint:
     runs-on: ubuntu-latest
@@ -64,3 +70,24 @@ jobs:
         run: |
           go install github.com/securego/gosec/v2/cmd/gosec@latest
           gosec -exclude-dir=agent ./...
+
+  chart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Lint chart
+        run: helm lint charts/netcup-failover-controller
+
+      - name: Render chart
+        run: helm template charts/netcup-failover-controller > /dev/null
+
+      - name: CRD copies are in sync
+        run: |
+          # The chart copy wraps the same manifest in an installCRD guard and
+          # adds labels; everything else must match config/crd/.
+          diff -B config/crd/netcupfailoverips.yaml \
+            <(sed '/^{{-/d; /^  labels:$/,+1d' charts/netcup-failover-controller/templates/crds/netcupfailoverips.yaml)

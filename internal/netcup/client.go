@@ -7,7 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -22,6 +24,7 @@ import (
 const TokenSecretKey = "token"
 
 const (
+	defaultCallTimeout      = 30 * time.Second
 	defaultTaskPollInterval = 2 * time.Second
 	defaultTaskTimeout      = 2 * time.Minute
 )
@@ -41,14 +44,20 @@ type API interface {
 type Session struct {
 	API    API
 	UserID int32
+	// CallTimeout bounds each individual SCP API call: neither the library's
+	// HTTP client nor a reconcile context carries a deadline of its own, so
+	// without it one stalled response would block the caller forever. Zero
+	// means the default (30s).
+	CallTimeout time.Duration
 	// TaskPollInterval and TaskTimeout bound the wait for the async routing
-	// tasks the SCP API returns. Connect sets defaults.
+	// tasks the SCP API returns. Zero means the defaults (2s and 2m).
 	TaskPollInterval time.Duration
 	TaskTimeout      time.Duration
 
 	close func()
 }
 
+// Close releases the session's HTTP and token-refresh resources.
 func (s *Session) Close() {
 	if s.close != nil {
 		s.close()
@@ -67,33 +76,49 @@ type Config struct {
 	AuthURL string
 }
 
-// Connect builds an authenticated session against the production endpoints.
-// See Config.Connect for overrides.
-func Connect(tokenJSON []byte, onRefresh func(tokenJSON []byte)) (*Session, error) {
-	return Config{}.Connect(tokenJSON, onRefresh)
+// ConfigFromEnv reads the optional endpoint overrides NETCUP_SCP_API_URL and
+// NETCUP_SCP_AUTH_URL. The controller and the login command share it so both
+// always talk to the same endpoints.
+func ConfigFromEnv() Config {
+	return Config{
+		APIBaseURL: os.Getenv("NETCUP_SCP_API_URL"),
+		AuthURL:    os.Getenv("NETCUP_SCP_AUTH_URL"),
+	}
+}
+
+// AuthManager builds an OAuth2 manager for the configured identity provider.
+// The caller owns it and must Close it.
+func (c Config) AuthManager(opts ...auth.Option) *auth.Manager {
+	if c.AuthURL != "" {
+		opts = append(opts, auth.WithAuthURL(c.AuthURL))
+	}
+	return auth.NewManager(opts...)
 }
 
 // Connect builds an authenticated session from a JSON-serialized OAuth2 token
-// (the file written by `netcup-scp auth login`). onRefresh, if non-nil, is
-// invoked with the re-serialized token whenever the IdP issues a fresh one, so
-// the caller can persist it before the stored refresh token expires.
+// (the TokenSecretKey value of the credentials Secret, seeded by
+// `netcup-failover-controller login`). onRefresh, if non-nil, is invoked with
+// the re-serialized token whenever the IdP issues a fresh one, so the caller
+// can persist it before the stored refresh token expires. It runs
+// synchronously on the goroutine making the API call that needed the refresh.
 func (c Config) Connect(tokenJSON []byte, onRefresh func(tokenJSON []byte)) (*Session, error) {
 	var tok auth.TokenResponse
 	if err := json.Unmarshal(tokenJSON, &tok); err != nil {
 		return nil, fmt.Errorf("parsing OAuth token: %w", err)
 	}
 	if tok.RefreshToken == "" {
-		return nil, fmt.Errorf("OAuth token has no refresh_token")
+		return nil, errors.New("OAuth token has no refresh_token")
 	}
 	userID, err := jwtUserID(tok.AccessToken)
 	if err != nil {
 		return nil, fmt.Errorf("extracting user ID from access token: %w", err)
 	}
 
-	var authOpts []auth.Option
-	if c.AuthURL != "" {
-		authOpts = append(authOpts, auth.WithAuthURL(c.AuthURL))
-	}
+	// Sessions live for a single reconcile, so the library's background
+	// refresh timer is off: tokens are refreshed on demand by the API call
+	// that needs one, and onRefresh never fires on another goroutine or after
+	// the session's owner has moved on.
+	authOpts := []auth.Option{auth.WithAutoRefresh(false)}
 	if onRefresh != nil {
 		authOpts = append(authOpts, auth.WithTokenRefreshCallback(func(t *auth.TokenResponse) {
 			data, err := json.Marshal(t) // #nosec G117 -- the token is intentionally serialized for storage in a K8s Secret
@@ -103,7 +128,7 @@ func (c Config) Connect(tokenJSON []byte, onRefresh func(tokenJSON []byte)) (*Se
 			onRefresh(data)
 		}))
 	}
-	mgr := auth.NewManager(authOpts...)
+	mgr := c.AuthManager(authOpts...)
 	mgr.LoadToken(&tok)
 
 	var clientOpts []scp.ClientOption
@@ -115,13 +140,7 @@ func (c Config) Connect(tokenJSON []byte, onRefresh func(tokenJSON []byte)) (*Se
 		mgr.Close()
 		return nil, fmt.Errorf("creating SCP client: %w", err)
 	}
-	return &Session{
-		API:              client,
-		UserID:           userID,
-		TaskPollInterval: defaultTaskPollInterval,
-		TaskTimeout:      defaultTaskTimeout,
-		close:            client.Close,
-	}, nil
+	return &Session{API: client, UserID: userID, close: client.Close}, nil
 }
 
 // IsRateLimited reports whether err is an HTTP 429 from the SCP API (failover
@@ -138,7 +157,7 @@ func IsRateLimited(err error) bool {
 func jwtUserID(accessToken string) (int32, error) {
 	parts := strings.Split(accessToken, ".")
 	if len(parts) != 3 {
-		return 0, fmt.Errorf("access token is not a JWT")
+		return 0, errors.New("access token is not a JWT")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
@@ -151,7 +170,7 @@ func jwtUserID(accessToken string) (int32, error) {
 		return 0, fmt.Errorf("parsing JWT claims: %w", err)
 	}
 	if claims.ID == "" {
-		return 0, fmt.Errorf("JWT has no id claim")
+		return 0, errors.New("JWT has no id claim")
 	}
 	id, err := strconv.ParseInt(claims.ID, 10, 32)
 	if err != nil {
