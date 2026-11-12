@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -49,10 +50,8 @@ func TestSelectNode(t *testing.T) {
 		selectNode("group-a", nodes, nil)
 		got := []string{nodes[0].Name, nodes[1].Name, nodes[2].Name}
 		want := []string{"node-c", "node-a", "node-b"}
-		for i := range want {
-			if got[i] != want[i] {
-				t.Fatalf("input slice reordered: %v, want %v", got, want)
-			}
+		if !slices.Equal(got, want) {
+			t.Fatalf("input slice reordered: %v, want %v", got, want)
 		}
 	})
 
@@ -157,4 +156,11 @@ func TestNodePredicate(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("non-Node objects are ignored", func(t *testing.T) {
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "s"}}
+		if pred.Update(event.UpdateEvent{ObjectOld: secret, ObjectNew: secret}) {
+			t.Error("predicate = true for a non-Node object, want false")
+		}
+	})
 }

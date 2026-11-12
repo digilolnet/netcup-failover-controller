@@ -1,0 +1,28 @@
+# Leader election is namespaced, not cluster-wide: the lease and the events
+# recorded about it live in the controller's own namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: netcup-failover-controller-leader-election
+  namespace: netcup-system
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, create, update]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: netcup-failover-controller-leader-election
+  namespace: netcup-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: netcup-failover-controller-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: netcup-failover-controller
+    namespace: netcup-system

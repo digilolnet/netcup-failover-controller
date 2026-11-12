@@ -10,6 +10,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -17,21 +18,24 @@ import (
 	netcupv1alpha1 "github.com/digilolnet/netcup-failover-controller/api/v1alpha1"
 )
 
-// eligibleNodes lists Ready nodes matching the resource's label selector (all
-// Ready nodes when the selector is nil).
-func (r *FailoverIPReconciler) eligibleNodes(ctx context.Context, selector *metav1.LabelSelector) ([]corev1.Node, error) {
-	listOpts := []client.ListOption{}
-	if selector != nil {
-		sel, err := metav1.LabelSelectorAsSelector(selector)
-		if err != nil {
-			return nil, fmt.Errorf("invalid nodeSelector: %w", err)
-		}
-		listOpts = append(listOpts, client.MatchingLabelsSelector{Selector: sel})
+// nodeSelector converts the resource's label selector; a nil selector matches
+// every node.
+func nodeSelector(selector *metav1.LabelSelector) (labels.Selector, error) {
+	if selector == nil {
+		return labels.Everything(), nil
 	}
+	sel, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return nil, fmt.Errorf("invalid nodeSelector: %w", err)
+	}
+	return sel, nil
+}
 
+// eligibleNodes lists the Ready nodes matching selector.
+func (r *FailoverIPReconciler) eligibleNodes(ctx context.Context, selector labels.Selector) ([]corev1.Node, error) {
 	var nodeList corev1.NodeList
-	if err := r.List(ctx, &nodeList, listOpts...); err != nil {
-		return nil, err
+	if err := r.List(ctx, &nodeList, client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, fmt.Errorf("listing nodes: %w", err)
 	}
 
 	eligible := []corev1.Node{}
@@ -45,10 +49,13 @@ func (r *FailoverIPReconciler) eligibleNodes(ctx context.Context, selector *meta
 
 // occupiedNodes reports which nodes already host another failover IP group,
 // so selectNode can spread groups for bandwidth splitting.
-func (r *FailoverIPReconciler) occupiedNodes(ctx context.Context, current *netcupv1alpha1.NetcupFailoverIP) (map[string]bool, error) {
+func (r *FailoverIPReconciler) occupiedNodes(
+	ctx context.Context,
+	current *netcupv1alpha1.NetcupFailoverIP,
+) (map[string]bool, error) {
 	var list netcupv1alpha1.NetcupFailoverIPList
 	if err := r.List(ctx, &list); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listing NetcupFailoverIPs: %w", err)
 	}
 	occupied := map[string]bool{}
 	for _, fip := range list.Items {

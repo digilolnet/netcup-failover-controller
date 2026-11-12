@@ -9,9 +9,12 @@ import (
 )
 
 var (
-	GroupVersion  = schema.GroupVersion{Group: "netcup.digilol.net", Version: "v1alpha1"}
+	// GroupVersion is the API group and version of the types in this package.
+	GroupVersion = schema.GroupVersion{Group: "netcup.digilol.net", Version: "v1alpha1"}
+	// SchemeBuilder collects the functions that register this package's types.
 	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes)
-	AddToScheme   = SchemeBuilder.AddToScheme
+	// AddToScheme registers this package's types with a scheme.
+	AddToScheme = SchemeBuilder.AddToScheme
 )
 
 func addKnownTypes(s *runtime.Scheme) error {

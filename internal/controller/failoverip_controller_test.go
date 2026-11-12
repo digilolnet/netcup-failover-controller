@@ -5,24 +5,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/digilolnet/go-netcup-scp/pkg/scp"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	netcupv1alpha1 "github.com/digilolnet/netcup-failover-controller/api/v1alpha1"
 	"github.com/digilolnet/netcup-failover-controller/internal/netcup"
 )
-
-func ptr[T any](v T) *T { return &v }
 
 type routeCall struct {
 	family     string // "v4" or "v6"
@@ -119,7 +123,7 @@ func (m *mockAPI) route(call routeCall) (*scp.TaskInfo, error) {
 		state = scp.TaskStateFINISHED
 	}
 	var task scp.TaskInfo
-	task.Uuid = ptr("task-1")
+	task.Uuid = new("task-1")
 	task.State = &state
 	return &task, nil
 }
@@ -203,11 +207,24 @@ func routedFIP(name string, ips ...string) *netcupv1alpha1.NetcupFailoverIP {
 
 func newReconciler(t *testing.T, api *mockAPI, objs ...client.Object) *FailoverIPReconciler {
 	t.Helper()
+	return newReconcilerWithInterceptor(t, api, interceptor.Funcs{}, objs...)
+}
+
+// newReconcilerWithInterceptor is newReconciler with hooks into the fake
+// client, for simulating API server failures.
+func newReconcilerWithInterceptor(
+	t *testing.T,
+	api *mockAPI,
+	funcs interceptor.Funcs,
+	objs ...client.Object,
+) *FailoverIPReconciler {
+	t.Helper()
 	api.t = t
 	cl := fake.NewClientBuilder().
 		WithScheme(testScheme(t)).
 		WithObjects(objs...).
 		WithStatusSubresource(&netcupv1alpha1.NetcupFailoverIP{}).
+		WithInterceptorFuncs(funcs).
 		Build()
 	return &FailoverIPReconciler{
 		Client: cl,
@@ -271,13 +288,8 @@ func TestReconcile_RoutesAllIPs(t *testing.T) {
 		{family: "v4", failoverID: 11, serverID: 101},
 		{family: "v6", failoverID: 21, serverID: 101},
 	}
-	if len(api.routeCalls) != len(want) {
-		t.Fatalf("expected %d route calls, got: %+v", len(want), api.routeCalls)
-	}
-	for i, call := range api.routeCalls {
-		if call != want[i] {
-			t.Errorf("route call %d = %+v, want %+v", i, call, want[i])
-		}
+	if !slices.Equal(api.routeCalls, want) {
+		t.Fatalf("route calls = %+v, want %+v", api.routeCalls, want)
 	}
 
 	fip := getFIP(t, r, "group-a")
@@ -292,7 +304,7 @@ func TestReconcile_RoutesAllIPs(t *testing.T) {
 func TestReconcile_SkipsAlreadyRoutedIPs(t *testing.T) {
 	api := &mockAPI{
 		servers: []scp.ServerListMinimal{server(t, 101, "srv-a")},
-		v4:      []scp.FailoverIPv4{fv4(t, 11, "198.51.100.1", ptr(int32(101)))}, // already on target
+		v4:      []scp.FailoverIPv4{fv4(t, 11, "198.51.100.1", new(int32(101)))}, // already on target
 		v6:      []scp.FailoverIPv6{fv6(t, 21, "2001:db8::", 64, nil)},
 	}
 	r := newReconciler(t, api,
@@ -330,7 +342,7 @@ func TestReconcile_SpecChangeRoutesOnlyNewIP(t *testing.T) {
 	api := &mockAPI{
 		servers: []scp.ServerListMinimal{server(t, 101, "srv-a")},
 		v4: []scp.FailoverIPv4{
-			fv4(t, 11, "198.51.100.1", ptr(int32(101))),
+			fv4(t, 11, "198.51.100.1", new(int32(101))),
 			fv4(t, 12, "198.51.100.2", nil),
 		},
 	}
@@ -351,7 +363,7 @@ func TestReconcile_SpecChangeRoutesOnlyNewIP(t *testing.T) {
 func TestReconcile_ReroutesWhenNodeFails(t *testing.T) {
 	api := &mockAPI{
 		servers: []scp.ServerListMinimal{server(t, 101, "srv-a"), server(t, 102, "srv-b")},
-		v4:      []scp.FailoverIPv4{fv4(t, 11, "198.51.100.1", ptr(int32(101)))},
+		v4:      []scp.FailoverIPv4{fv4(t, 11, "198.51.100.1", new(int32(101)))},
 	}
 	r := newReconciler(t, api,
 		routedFIP("group-a", "198.51.100.1/32"),
@@ -427,12 +439,133 @@ func TestReconcile_PersistsRefreshedToken(t *testing.T) {
 	if _, err := reconcileOnce(t, r, "group-a"); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
+	if got := secretToken(t, r); got != `{"refresh_token":"rotated"}` {
+		t.Errorf("secret token = %q, want the rotated token", got)
+	}
+}
+
+func secretToken(t *testing.T, r *FailoverIPReconciler) string {
+	t.Helper()
 	var secret corev1.Secret
 	if err := r.Get(t.Context(), types.NamespacedName{Name: "netcup-credentials", Namespace: "default"}, &secret); err != nil {
 		t.Fatalf("getting secret: %v", err)
 	}
-	if got := string(secret.Data["token"]); got != `{"refresh_token":"rotated"}` {
+	return string(secret.Data["token"])
+}
+
+// A token refreshed just as the reconcile is canceled (shutdown, lost
+// leadership) must still be saved: the IdP may already have invalidated the
+// previous refresh token.
+func TestPersistToken_SurvivesCanceledContext(t *testing.T) {
+	// The fake client ignores contexts; make it honor them like a real one.
+	funcs := interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(t, &mockAPI{}, funcs, testSecret())
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	r.persistToken(ctx, "netcup-credentials", []byte(`{"refresh_token":"rotated"}`))
+
+	if got := secretToken(t, r); got != `{"refresh_token":"rotated"}` {
 		t.Errorf("secret token = %q, want the rotated token", got)
+	}
+}
+
+// A concurrent writer (e.g. `login`) must not make the controller drop a
+// refreshed token.
+func TestPersistToken_RetriesOnConflict(t *testing.T) {
+	conflicts := 1
+	funcs := interceptor.Funcs{
+		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if conflicts > 0 {
+				conflicts--
+				return apierrors.NewConflict(schema.GroupResource{Resource: "secrets"}, obj.GetName(), errors.New("stale"))
+			}
+			return c.Update(ctx, obj, opts...)
+		},
+	}
+	r := newReconcilerWithInterceptor(t, &mockAPI{}, funcs, testSecret())
+
+	r.persistToken(t.Context(), "netcup-credentials", []byte(`{"refresh_token":"rotated"}`))
+
+	if got := secretToken(t, r); got != `{"refresh_token":"rotated"}` {
+		t.Errorf("secret token = %q, want the rotated token", got)
+	}
+}
+
+func TestReconcile_SpreadsGroupsAcrossNodes(t *testing.T) {
+	api := &mockAPI{
+		servers: []scp.ServerListMinimal{server(t, 101, "srv-a"), server(t, 102, "srv-b")},
+		v4: []scp.FailoverIPv4{
+			fv4(t, 11, "198.51.100.1", new(int32(101))),
+			fv4(t, 12, "198.51.100.2", nil),
+		},
+	}
+	r := newReconciler(t, api,
+		routedFIP("group-a", "198.51.100.1/32"), // already on node-a
+		testFIP("group-b", "198.51.100.2/32"),
+		readyNode("node-a", "srv-a"),
+		readyNode("node-b", "srv-b"),
+		testSecret(),
+	)
+
+	if _, err := r.Reconcile(t.Context(), ctrl.Request{NamespacedName: types.NamespacedName{Name: "group-b"}}); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if got := getFIP(t, r, "group-b").Status.CurrentNode; got != "node-b" {
+		t.Errorf("group-b currentNode = %q, want the unoccupied node-b", got)
+	}
+	want := []routeCall{{family: "v4", failoverID: 12, serverID: 102}}
+	if !slices.Equal(api.routeCalls, want) {
+		t.Errorf("route calls = %+v, want %+v", api.routeCalls, want)
+	}
+}
+
+// Upstream errors can embed whole response bodies; an oversized condition
+// message would make the API server reject the status update.
+func TestReconcile_TruncatesLongConditionMessage(t *testing.T) {
+	api := &mockAPI{listServersErr: errors.New(strings.Repeat("é", 5000))}
+	r := newReconciler(t, api, testFIP("group-a", "198.51.100.1/32"), readyNode("node-a", "srv-a"), testSecret())
+
+	if _, err := reconcileOnce(t, r, "group-a"); err == nil {
+		t.Fatal("expected an error, got nil")
+	}
+	msg := routedCondition(t, r, "group-a").Message
+	if len(msg) > maxConditionMessage+len("…") {
+		t.Errorf("condition message is %d bytes, want at most %d", len(msg), maxConditionMessage+len("…"))
+	}
+	if !utf8.ValidString(msg) || !strings.HasSuffix(msg, "…") {
+		t.Errorf("condition message must stay valid UTF-8 and end with an ellipsis, got suffix %q", msg[len(msg)-8:])
+	}
+}
+
+func TestEnqueueAll(t *testing.T) {
+	r := newReconciler(t, &mockAPI{}, testFIP("group-a", "198.51.100.1/32"), testFIP("group-b", "198.51.100.2/32"))
+
+	reqs := r.enqueueAll(t.Context(), readyNode("node-a", "srv-a"))
+
+	got := make([]string, len(reqs))
+	for i, req := range reqs {
+		if req.Namespace != "" {
+			t.Errorf("request %v has a namespace; NetcupFailoverIP is cluster-scoped", req)
+		}
+		got[i] = req.Name
+	}
+	slices.Sort(got)
+	if want := []string{"group-a", "group-b"}; !slices.Equal(got, want) {
+		t.Errorf("enqueued %v, want %v", got, want)
 	}
 }
 
@@ -509,6 +642,23 @@ func TestReconcile_InvalidCIDR(t *testing.T) {
 	}
 	if cond := routedCondition(t, r, "group-a"); cond.Reason != netcupv1alpha1.ReasonInvalidIP {
 		t.Errorf("condition reason = %s, want %s", cond.Reason, netcupv1alpha1.ReasonInvalidIP)
+	}
+}
+
+func TestReconcile_InvalidNodeSelector(t *testing.T) {
+	fip := testFIP("group-a", "198.51.100.1/32")
+	fip.Spec.NodeSelector = &metav1.LabelSelector{
+		MatchExpressions: []metav1.LabelSelectorRequirement{
+			{Key: "role", Operator: metav1.LabelSelectorOpIn}, // In requires values
+		},
+	}
+	r := newReconciler(t, &mockAPI{}, fip, readyNode("node-a", "srv-a"), testSecret())
+
+	if _, err := reconcileOnce(t, r, "group-a"); err != nil {
+		t.Fatalf("expected no error (spec fix bumps generation), got: %v", err)
+	}
+	if cond := routedCondition(t, r, "group-a"); cond.Reason != netcupv1alpha1.ReasonInvalidNodeSelector {
+		t.Errorf("condition reason = %s, want %s", cond.Reason, netcupv1alpha1.ReasonInvalidNodeSelector)
 	}
 }
 

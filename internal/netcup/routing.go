@@ -1,6 +1,7 @@
 package netcup
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"net"
@@ -43,7 +44,9 @@ func ParseRoutes(cidrs []string) ([]Route, error) {
 // keyed by server name. Callers use it both to resolve a node's server-name
 // annotation and to know which nodes this account can route to at all.
 func (s *Session) ServerIDsByName(ctx context.Context) (map[string]int32, error) {
-	servers, err := s.API.ListServers(ctx, nil)
+	callCtx, cancel := s.callContext(ctx)
+	defer cancel()
+	servers, err := s.API.ListServers(callCtx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("listing servers: %w", err)
 	}
@@ -61,18 +64,9 @@ func (s *Session) ServerIDsByName(ctx context.Context) (map[string]int32, error)
 // failover IP listings, so a retry after a partial failure, rate limit, or
 // crash skips the routes that already succeeded.
 func (s *Session) EnsureRouted(ctx context.Context, routes []Route, serverID int32) error {
-	var v4 []scp.FailoverIPv4
-	var v6 []scp.FailoverIPv6
-	var err error
-	if slices.ContainsFunc(routes, func(r Route) bool { return !r.isIPv6 }) {
-		if v4, err = s.API.ListFailoverIPv4(ctx, s.UserID, nil); err != nil {
-			return fmt.Errorf("listing failover IPv4 addresses: %w", err)
-		}
-	}
-	if slices.ContainsFunc(routes, func(r Route) bool { return r.isIPv6 }) {
-		if v6, err = s.API.ListFailoverIPv6(ctx, s.UserID, nil); err != nil {
-			return fmt.Errorf("listing failover IPv6 prefixes: %w", err)
-		}
+	v4, v6, err := s.listFailoverIPs(ctx, routes)
+	if err != nil {
+		return err
 	}
 
 	for _, rt := range routes {
@@ -84,12 +78,7 @@ func (s *Session) EnsureRouted(ctx context.Context, routes []Route, serverID int
 			continue
 		}
 
-		var task *scp.TaskInfo
-		if rt.isIPv6 {
-			task, err = s.API.RouteFailoverIPv6(ctx, s.UserID, failoverID, serverID)
-		} else {
-			task, err = s.API.RouteFailoverIPv4(ctx, s.UserID, failoverID, serverID)
-		}
+		task, err := s.route(ctx, rt, failoverID, serverID)
 		if err != nil {
 			return fmt.Errorf("routing %s: %w", rt.cidr, err)
 		}
@@ -98,6 +87,54 @@ func (s *Session) EnsureRouted(ctx context.Context, routes []Route, serverID int
 		}
 	}
 	return nil
+}
+
+// callContext derives the context for one SCP API call, bounded by
+// CallTimeout.
+func (s *Session) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, cmp.Or(s.CallTimeout, defaultCallTimeout))
+}
+
+// listFailoverIPs fetches the account's failover IPs, skipping the address
+// family no route needs.
+func (s *Session) listFailoverIPs(ctx context.Context, routes []Route) ([]scp.FailoverIPv4, []scp.FailoverIPv6, error) {
+	var v4 []scp.FailoverIPv4
+	var v6 []scp.FailoverIPv6
+	if slices.ContainsFunc(routes, func(r Route) bool { return !r.isIPv6 }) {
+		callCtx, cancel := s.callContext(ctx)
+		defer cancel()
+		var err error
+		if v4, err = s.API.ListFailoverIPv4(callCtx, s.UserID, nil); err != nil {
+			return nil, nil, fmt.Errorf("listing failover IPv4 addresses: %w", err)
+		}
+	}
+	if slices.ContainsFunc(routes, func(r Route) bool { return r.isIPv6 }) {
+		callCtx, cancel := s.callContext(ctx)
+		defer cancel()
+		var err error
+		if v6, err = s.API.ListFailoverIPv6(callCtx, s.UserID, nil); err != nil {
+			return nil, nil, fmt.Errorf("listing failover IPv6 prefixes: %w", err)
+		}
+	}
+	return v4, v6, nil
+}
+
+// route issues the routing request for one failover IP and returns its async
+// task.
+func (s *Session) route(ctx context.Context, rt Route, failoverID, serverID int32) (*scp.TaskInfo, error) {
+	ctx, cancel := s.callContext(ctx)
+	defer cancel()
+	if rt.isIPv6 {
+		return s.API.RouteFailoverIPv6(ctx, s.UserID, failoverID, serverID)
+	}
+	return s.API.RouteFailoverIPv4(ctx, s.UserID, failoverID, serverID)
+}
+
+// getTask fetches the current state of an async task.
+func (s *Session) getTask(ctx context.Context, uuid string) (*scp.TaskInfo, error) {
+	ctx, cancel := s.callContext(ctx)
+	defer cancel()
+	return s.API.GetTask(ctx, uuid)
 }
 
 // findFailoverIP matches a Route against the account's failover IPs and
@@ -145,7 +182,9 @@ func (s *Session) waitTask(ctx context.Context, task *scp.TaskInfo) error {
 	if task == nil || task.Uuid == nil {
 		return nil
 	}
-	deadline := time.Now().Add(s.TaskTimeout)
+	timeout := cmp.Or(s.TaskTimeout, defaultTaskTimeout)
+	interval := cmp.Or(s.TaskPollInterval, defaultTaskPollInterval)
+	deadline := time.Now().Add(timeout)
 	for {
 		if task.State != nil {
 			switch *task.State {
@@ -156,14 +195,14 @@ func (s *Session) waitTask(ctx context.Context, task *scp.TaskInfo) error {
 			}
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("task %s still running after %s", *task.Uuid, s.TaskTimeout)
+			return fmt.Errorf("task %s still running after %s", *task.Uuid, timeout)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(s.TaskPollInterval):
+		case <-time.After(interval):
 		}
-		next, err := s.API.GetTask(ctx, *task.Uuid)
+		next, err := s.getTask(ctx, *task.Uuid)
 		if err != nil {
 			return fmt.Errorf("polling task %s: %w", *task.Uuid, err)
 		}
