@@ -16,6 +16,13 @@ Multiple `NetcupFailoverIP` resources are spread across different nodes for band
 4. It resolves the node's SCP server (via the `netcup.digilol.net/server-name` annotation) and routes each failover IP to it through the SCP REST API, skipping IPs the API already reports as routed there.
 5. Status is updated with the current node and a `Routed` condition.
 6. Node changes trigger re-evaluation for all resources; a group stays on its current node while that node remains healthy and eligible.
+7. Every 5 minutes (configurable, see [Drift check](#drift-check)) the controller compares netcup's actual routing with the status and re-routes if something else changed it.
+
+### What `Routed=True` means
+
+`Routed=True` means netcup routes the group's IPs to the server of `status.currentNode`. It does **not** mean the node answers on those addresses: the controller never configures or probes them. A node that is `Ready` but cannot serve the address (address missing, or disabled by duplicate address detection, see below) is still a valid target, and the resource will show `Routed=True` while the address is unreachable. Monitor the failover addresses from outside the cluster.
+
+A node counts as healthy when its `Ready` condition is true, so a hard crash is only acted on once Kubernetes marks the node `NotReady`.
 
 netcup rate-limits failover routing (10 requests per 5 minutes). When the limit is hit the controller records a `RateLimited` condition and retries after 5 minutes — IPs that already routed are never re-routed, so a large group converges across windows.
 
@@ -70,6 +77,36 @@ machine:
           - 2001:db8::/64 # the failover /64
           - 2001:db8:1:2:a8bb:ccff:fedd:eeff/64 # native EUI-64 host address
 ```
+
+### Nodes on a shared segment: use loopback for IPv6
+
+If the eligible nodes share a layer-2 segment and all carry the same failover IPv6 address on their public interface, the kernel's duplicate address detection (DAD) on one node can see another node's copy and disable its own. `ip -6 addr` then shows the address as `dadfailed`, and which node loses depends on boot timing. When the controller routes the prefix to that node, the address is unreachable although the resource reports `Routed=True`.
+
+Avoid this by putting the failover IPv6 addresses you serve on the loopback interface as `/128`s, where DAD does not run. netcup routes the prefix to the server, so the addresses do not need to be on the public interface. (This was confirmed by a manual test on one node, not yet by a full failover.)
+
+```yaml
+# patch.yaml
+machine:
+  network:
+    interfaces:
+      - interface: lo
+        addresses:
+          - 2001:db8::1/128 # each failover IPv6 address the node serves
+```
+
+Alternatively keep the address on the public interface but add it with DAD disabled (`ip -6 addr add … nodad`). IPv4 `/32` failover addresses are not affected.
+
+### Keeping a node out of rotation
+
+The controller only looks at the node's `Ready` condition and the resource's `nodeSelector`. To exclude a node that is `Ready` but cannot serve the addresses, select on a label that you (or an agent on the node) control, and remove it from that node:
+
+```yaml
+nodeSelector:
+  matchLabels:
+    example.com/failover-capable: "true"
+```
+
+Removing the label is a Node change, so the controller moves the group to another eligible node immediately.
 
 ### Applying on Talos Linux
 
@@ -187,6 +224,14 @@ NAME        NODE                   ROUTED   AGE
 primary     k8s-control-plane-1    True     5m
 secondary   k8s-control-plane-2    True     5m
 ```
+
+## Drift check
+
+A routed group is otherwise left alone until its spec or a node changes. So that a change made elsewhere (the SCP panel, another tool) does not go unnoticed, the controller periodically lists the account's failover IPs and compares them with `status.currentNode`. If they differ it logs the affected IPs and routes them back. The check only reads, so it does not use up the routing rate limit; a re-route does.
+
+The interval defaults to 5 minutes. Set the Helm value `resyncInterval` (or the `RESYNC_INTERVAL` environment variable) to a Go duration such as `10m`, or to `0` to disable the check.
+
+If the check itself fails (netcup API unavailable, credentials rejected), the `Routed` condition is left as it is and the check is retried with backoff; the failure appears in the controller log only.
 
 ## Multiple IP Groups
 

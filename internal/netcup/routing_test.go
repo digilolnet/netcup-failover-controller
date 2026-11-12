@@ -468,3 +468,30 @@ func TestFindFailoverIP(t *testing.T) {
 		})
 	}
 }
+
+func TestSession_Misrouted(t *testing.T) {
+	target, other := int32(101), int32(102)
+	api := &stubAPI{
+		v4: []scp.FailoverIPv4{
+			fv4(t, 1, "198.51.100.1", &target),
+			fv4(t, 2, "198.51.100.2", &other),
+		},
+		v6: []scp.FailoverIPv6{fv6(t, 3, "2001:db8::", 64, nil)},
+	}
+	routes := mustParseRoutes(t, "198.51.100.1/32", "198.51.100.2/32", "2001:db8::/64")
+
+	got, err := testSession(api).Misrouted(t.Context(), routes, target)
+	if err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if want := []string{"198.51.100.2/32", "2001:db8::/64"}; !slices.Equal(got, want) {
+		t.Errorf("Misrouted = %v, want %v", got, want)
+	}
+	if len(api.routeCalls) != 0 {
+		t.Errorf("Misrouted must only read, got route calls: %v", api.routeCalls)
+	}
+
+	if _, err := testSession(api).Misrouted(t.Context(), mustParseRoutes(t, "203.0.113.9/32"), target); err == nil {
+		t.Error("expected an error for a failover IP missing from the account")
+	}
+}

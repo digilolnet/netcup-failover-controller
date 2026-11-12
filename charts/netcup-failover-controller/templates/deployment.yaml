@@ -43,6 +43,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- with .Values.resyncInterval }}
+            - name: RESYNC_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
             {{- with .Values.netcup.apiUrl }}
             - name: NETCUP_SCP_API_URL
               value: {{ . | quote }}
