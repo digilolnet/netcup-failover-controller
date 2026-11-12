@@ -44,6 +44,11 @@ netcup:
   apiUrl: ""
   authUrl: ""
 
+# How often the controller checks that netcup still routes each group to its
+# node, re-routing if it was changed elsewhere. A Go duration; empty uses the
+# built-in default (5m), "0" disables the check.
+resyncInterval: ""
+
 # Namespace for the controller and its ServiceAccount.
 # NetcupFailoverIP resources are cluster-scoped and can be created in any namespace.
 namespace: netcup-system

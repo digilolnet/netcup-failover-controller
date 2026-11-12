@@ -7,6 +7,7 @@ import (
 	"cmp"
 	"fmt"
 	"os"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +35,28 @@ var scheme = runtime.NewScheme()
 // downward API; the fallback covers out-of-cluster runs (dev, local login).
 func controllerNamespace() string {
 	return cmp.Or(os.Getenv("CREDENTIALS_NAMESPACE"), "netcup-system")
+}
+
+// defaultResyncInterval is how often routed groups are compared against
+// netcup's actual routing. The check only reads, so it does not spend the
+// routing rate limit.
+const defaultResyncInterval = 5 * time.Minute
+
+// resyncInterval reads RESYNC_INTERVAL (a Go duration, e.g. "5m"). Unset
+// means the default; "0" disables the periodic check.
+func resyncInterval() (time.Duration, error) {
+	raw := os.Getenv("RESYNC_INTERVAL")
+	if raw == "" {
+		return defaultResyncInterval, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("parsing RESYNC_INTERVAL: %w", err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("RESYNC_INTERVAL must not be negative, got %s", raw)
+	}
+	return d, nil
 }
 
 func init() {
@@ -68,6 +91,12 @@ func main() {
 	namespace := controllerNamespace()
 	ctrl.Log.Info("starting netcup-failover-controller", "version", version, "namespace", namespace)
 
+	resync, err := resyncInterval()
+	if err != nil {
+		ctrl.Log.Error(err, "invalid configuration")
+		os.Exit(1)
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:           scheme,
 		LeaderElection:   true,
@@ -96,6 +125,7 @@ func main() {
 		Client:               mgr.GetClient(),
 		Connect:              netcup.ConfigFromEnv().Connect,
 		CredentialsNamespace: namespace,
+		ResyncInterval:       resync,
 	}).SetupWithManager(mgr); err != nil {
 		ctrl.Log.Error(err, "failed to setup controller")
 		os.Exit(1)

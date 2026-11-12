@@ -89,6 +89,27 @@ func (s *Session) EnsureRouted(ctx context.Context, routes []Route, serverID int
 	return nil
 }
 
+// Misrouted returns the CIDRs of the routes netcup does not currently route to
+// serverID. It only reads, so it does not count against the routing rate
+// limit.
+func (s *Session) Misrouted(ctx context.Context, routes []Route, serverID int32) ([]string, error) {
+	v4, v6, err := s.listFailoverIPs(ctx, routes)
+	if err != nil {
+		return nil, err
+	}
+	var misrouted []string
+	for _, rt := range routes {
+		_, routedTo, err := findFailoverIP(rt, v4, v6)
+		if err != nil {
+			return nil, err
+		}
+		if routedTo == nil || *routedTo != serverID {
+			misrouted = append(misrouted, rt.cidr)
+		}
+	}
+	return misrouted, nil
+}
+
 // callContext derives the context for one SCP API call, bounded by
 // CallTimeout.
 func (s *Session) callContext(ctx context.Context) (context.Context, context.CancelFunc) {

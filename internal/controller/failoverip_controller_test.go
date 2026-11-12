@@ -750,3 +750,114 @@ func TestReconcile_TaskError(t *testing.T) {
 		t.Errorf("condition reason = %s, want %s", cond.Reason, netcupv1alpha1.ReasonRoutingFailed)
 	}
 }
+
+func TestReconcile_Resync(t *testing.T) {
+	const interval = time.Hour
+	srvA, srvB := int32(101), int32(102)
+
+	newResyncing := func(t *testing.T, api *mockAPI) *FailoverIPReconciler {
+		t.Helper()
+		r := newReconciler(t, api, routedFIP("group-a", "198.51.100.1/32"),
+			readyNode("node-a", "srv-a"), testSecret())
+		r.ResyncInterval = interval
+		return r
+	}
+
+	t.Run("routing intact schedules the next check without writes", func(t *testing.T) {
+		api := &mockAPI{
+			servers: []scp.ServerListMinimal{server(t, srvA, "srv-a")},
+			v4:      []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", &srvA)},
+		}
+		r := newResyncing(t, api)
+		before := getFIP(t, r, "group-a").ResourceVersion
+
+		res, err := reconcileOnce(t, r, "group-a")
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if res.RequeueAfter != interval {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, interval)
+		}
+		if len(api.routeCalls) != 0 {
+			t.Errorf("expected no route calls, got: %+v", api.routeCalls)
+		}
+		if after := getFIP(t, r, "group-a").ResourceVersion; after != before {
+			t.Errorf("status was written during an uneventful check (resourceVersion %s -> %s)", before, after)
+		}
+
+		// Until the interval elapses a reconcile (e.g. from a Node event)
+		// must not ask netcup again.
+		api.listServersErr = errors.New("netcup must not be asked again")
+		res, err = reconcileOnce(t, r, "group-a")
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if res.RequeueAfter <= 0 || res.RequeueAfter > interval {
+			t.Errorf("RequeueAfter = %v, want the remainder of %v", res.RequeueAfter, interval)
+		}
+	})
+
+	t.Run("drift is re-routed", func(t *testing.T) {
+		api := &mockAPI{
+			servers: []scp.ServerListMinimal{server(t, srvA, "srv-a"), server(t, srvB, "srv-b")},
+			v4:      []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", &srvB)}, // moved in the SCP panel
+		}
+		r := newResyncing(t, api)
+
+		res, err := reconcileOnce(t, r, "group-a")
+		if err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if len(api.routeCalls) != 1 || api.routeCalls[0].serverID != srvA {
+			t.Fatalf("expected one route call back to server %d, got: %+v", srvA, api.routeCalls)
+		}
+		if res.RequeueAfter != interval {
+			t.Errorf("RequeueAfter = %v, want %v", res.RequeueAfter, interval)
+		}
+		if cond := routedCondition(t, r, "group-a"); cond.Status != metav1.ConditionTrue {
+			t.Errorf("Routed = %s (%s), want True after re-routing", cond.Status, cond.Message)
+		}
+	})
+
+	t.Run("failed drift repair flips the condition", func(t *testing.T) {
+		api := &mockAPI{
+			servers:  []scp.ServerListMinimal{server(t, srvA, "srv-a")},
+			v4:       []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", nil)},
+			routeErr: func(routeCall) error { return errors.New("unexpected status code: 500") },
+		}
+		r := newResyncing(t, api)
+
+		if _, err := reconcileOnce(t, r, "group-a"); err == nil {
+			t.Fatal("expected the routing error, got nil")
+		}
+		cond := routedCondition(t, r, "group-a")
+		if cond.Status != metav1.ConditionFalse || cond.Reason != netcupv1alpha1.ReasonRoutingFailed {
+			t.Errorf("Routed = %s/%s, want False/%s", cond.Status, cond.Reason, netcupv1alpha1.ReasonRoutingFailed)
+		}
+	})
+
+	t.Run("a failed check leaves the condition alone and is retried", func(t *testing.T) {
+		api := &mockAPI{listServersErr: errors.New("scp unavailable")}
+		r := newResyncing(t, api)
+
+		for range 2 { // not marked verified, so the next reconcile checks again
+			if _, err := reconcileOnce(t, r, "group-a"); err == nil {
+				t.Fatal("expected the lookup error, got nil")
+			}
+		}
+		if cond := routedCondition(t, r, "group-a"); cond.Status != metav1.ConditionTrue {
+			t.Errorf("Routed = %s/%s, want it to stay True", cond.Status, cond.Reason)
+		}
+	})
+
+	t.Run("deleting the resource forgets its last check", func(t *testing.T) {
+		r := newResyncing(t, &mockAPI{})
+		r.routed("gone")
+		if _, err := reconcileOnce(t, r, "gone"); err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if _, ok := r.verified["gone"]; ok {
+			t.Error("verified entry survived the resource's deletion")
+		}
+	})
+}
