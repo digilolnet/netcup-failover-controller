@@ -334,7 +334,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-Everything is derived from the tag — no version bumps in the repo are needed. Images are tagged as `X.Y.Z`, `X.Y`, `X`, and `latest`, signed with cosign, and published with provenance and SBOM attestations. The same workflow sets the chart's `version`/`appVersion` from the tag, packages it, and publishes it to the Helm repo on GitHub Pages.
+Everything is derived from the tag — no version bumps in the repo are needed. Images are tagged as `X.Y.Z`, `X.Y`, `X`, and `latest`; a pre-release tag such as `v1.2.0-rc.1` publishes only its own version and never moves `latest`. Images are signed with cosign, and published with provenance and SBOM attestations. The same workflow sets the chart's `version`/`appVersion` from the tag, packages it, and publishes it to the Helm repo on GitHub Pages.
 
 ## License
 
