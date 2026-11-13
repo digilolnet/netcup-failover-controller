@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -751,25 +752,45 @@ func TestReconcile_TaskError(t *testing.T) {
 	}
 }
 
+// drainEvents returns the "<type> <reason>" of every event recorded so far.
+func drainEvents(rec *events.FakeRecorder) []string {
+	var got []string
+	for {
+		select {
+		case e := <-rec.Events:
+			fields := strings.Fields(e)
+			got = append(got, fields[0]+" "+fields[1])
+		default:
+			return got
+		}
+	}
+}
+
+func condition(t *testing.T, r *FailoverIPReconciler, name, conditionType string) *metav1.Condition {
+	t.Helper()
+	return meta.FindStatusCondition(getFIP(t, r, name).Status.Conditions, conditionType)
+}
+
 func TestReconcile_Resync(t *testing.T) {
 	const interval = time.Hour
 	srvA, srvB := int32(101), int32(102)
 
-	newResyncing := func(t *testing.T, api *mockAPI) *FailoverIPReconciler {
+	newResyncing := func(t *testing.T, api *mockAPI) (*FailoverIPReconciler, *events.FakeRecorder) {
 		t.Helper()
 		r := newReconciler(t, api, routedFIP("group-a", "198.51.100.1/32"),
 			readyNode("node-a", "srv-a"), testSecret())
+		rec := events.NewFakeRecorder(10)
 		r.ResyncInterval = interval
-		return r
+		r.Recorder = rec
+		return r, rec
 	}
 
-	t.Run("routing intact schedules the next check without writes", func(t *testing.T) {
+	t.Run("routing intact records the check and schedules the next", func(t *testing.T) {
 		api := &mockAPI{
 			servers: []scp.ServerListMinimal{server(t, srvA, "srv-a")},
 			v4:      []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", &srvA)},
 		}
-		r := newResyncing(t, api)
-		before := getFIP(t, r, "group-a").ResourceVersion
+		r, rec := newResyncing(t, api)
 
 		res, err := reconcileOnce(t, r, "group-a")
 		if err != nil {
@@ -781,8 +802,15 @@ func TestReconcile_Resync(t *testing.T) {
 		if len(api.routeCalls) != 0 {
 			t.Errorf("expected no route calls, got: %+v", api.routeCalls)
 		}
-		if after := getFIP(t, r, "group-a").ResourceVersion; after != before {
-			t.Errorf("status was written during an uneventful check (resourceVersion %s -> %s)", before, after)
+		if got := getFIP(t, r, "group-a").Status.LastVerifiedTime; got == nil || time.Since(got.Time) > time.Minute {
+			t.Errorf("lastVerifiedTime = %v, want about now", got)
+		}
+		if cond := condition(t, r, "group-a", netcupv1alpha1.ConditionVerified); cond == nil ||
+			cond.Status != metav1.ConditionTrue {
+			t.Errorf("Verified = %+v, want True", cond)
+		}
+		if got := drainEvents(rec); len(got) != 0 {
+			t.Errorf("an uneventful check recorded events: %v", got)
 		}
 
 		// Until the interval elapses a reconcile (e.g. from a Node event)
@@ -797,12 +825,31 @@ func TestReconcile_Resync(t *testing.T) {
 		}
 	})
 
+	t.Run("a check from before the interval is repeated", func(t *testing.T) {
+		api := &mockAPI{
+			servers: []scp.ServerListMinimal{server(t, srvA, "srv-a")},
+			v4:      []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", &srvA)},
+		}
+		fip := routedFIP("group-a", "198.51.100.1/32")
+		old := metav1.NewTime(time.Now().Add(-2 * interval))
+		fip.Status.LastVerifiedTime = &old
+		r := newReconciler(t, api, fip, readyNode("node-a", "srv-a"), testSecret())
+		r.ResyncInterval = interval
+
+		if _, err := reconcileOnce(t, r, "group-a"); err != nil {
+			t.Fatalf("expected no error, got: %v", err)
+		}
+		if got := getFIP(t, r, "group-a").Status.LastVerifiedTime; got == nil || !got.After(old.Time) {
+			t.Errorf("lastVerifiedTime = %v, want it advanced past %v", got, old)
+		}
+	})
+
 	t.Run("drift is re-routed", func(t *testing.T) {
 		api := &mockAPI{
 			servers: []scp.ServerListMinimal{server(t, srvA, "srv-a"), server(t, srvB, "srv-b")},
 			v4:      []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", &srvB)}, // moved in the SCP panel
 		}
-		r := newResyncing(t, api)
+		r, rec := newResyncing(t, api)
 
 		res, err := reconcileOnce(t, r, "group-a")
 		if err != nil {
@@ -817,6 +864,10 @@ func TestReconcile_Resync(t *testing.T) {
 		if cond := routedCondition(t, r, "group-a"); cond.Status != metav1.ConditionTrue {
 			t.Errorf("Routed = %s (%s), want True after re-routing", cond.Status, cond.Message)
 		}
+		want := []string{"Warning DriftDetected", "Normal Routed"}
+		if got := drainEvents(rec); !slices.Equal(got, want) {
+			t.Errorf("events = %v, want %v", got, want)
+		}
 	})
 
 	t.Run("failed drift repair flips the condition", func(t *testing.T) {
@@ -825,7 +876,7 @@ func TestReconcile_Resync(t *testing.T) {
 			v4:       []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", nil)},
 			routeErr: func(routeCall) error { return errors.New("unexpected status code: 500") },
 		}
-		r := newResyncing(t, api)
+		r, rec := newResyncing(t, api)
 
 		if _, err := reconcileOnce(t, r, "group-a"); err == nil {
 			t.Fatal("expected the routing error, got nil")
@@ -834,13 +885,20 @@ func TestReconcile_Resync(t *testing.T) {
 		if cond.Status != metav1.ConditionFalse || cond.Reason != netcupv1alpha1.ReasonRoutingFailed {
 			t.Errorf("Routed = %s/%s, want False/%s", cond.Status, cond.Reason, netcupv1alpha1.ReasonRoutingFailed)
 		}
+		if cond := condition(t, r, "group-a", netcupv1alpha1.ConditionVerified); cond != nil {
+			t.Errorf("Verified = %+v, want it absent while Routed is False", cond)
+		}
+		want := []string{"Warning DriftDetected", "Warning RoutingFailed"}
+		if got := drainEvents(rec); !slices.Equal(got, want) {
+			t.Errorf("events = %v, want %v", got, want)
+		}
 	})
 
-	t.Run("a failed check leaves the condition alone and is retried", func(t *testing.T) {
+	t.Run("a failed check keeps Routed, sets Verified=False and is retried", func(t *testing.T) {
 		api := &mockAPI{listServersErr: errors.New("scp unavailable")}
-		r := newResyncing(t, api)
+		r, _ := newResyncing(t, api)
 
-		for range 2 { // not marked verified, so the next reconcile checks again
+		for range 2 { // the check stays due, so the next reconcile tries again
 			if _, err := reconcileOnce(t, r, "group-a"); err == nil {
 				t.Fatal("expected the lookup error, got nil")
 			}
@@ -848,16 +906,53 @@ func TestReconcile_Resync(t *testing.T) {
 		if cond := routedCondition(t, r, "group-a"); cond.Status != metav1.ConditionTrue {
 			t.Errorf("Routed = %s/%s, want it to stay True", cond.Status, cond.Reason)
 		}
-	})
+		cond := condition(t, r, "group-a", netcupv1alpha1.ConditionVerified)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != netcupv1alpha1.ReasonServerLookupError {
+			t.Errorf("Verified = %+v, want False/%s", cond, netcupv1alpha1.ReasonServerLookupError)
+		}
+		if got := getFIP(t, r, "group-a").Status.LastVerifiedTime; got != nil {
+			t.Errorf("lastVerifiedTime = %v, want it unset after only failed checks", got)
+		}
 
-	t.Run("deleting the resource forgets its last check", func(t *testing.T) {
-		r := newResyncing(t, &mockAPI{})
-		r.routed("gone")
-		if _, err := reconcileOnce(t, r, "gone"); err != nil {
+		// Once netcup answers again the condition recovers.
+		api.listServersErr = nil
+		api.servers = []scp.ServerListMinimal{server(t, srvA, "srv-a")}
+		api.v4 = []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", &srvA)}
+		if _, err := reconcileOnce(t, r, "group-a"); err != nil {
 			t.Fatalf("expected no error, got: %v", err)
 		}
-		if _, ok := r.verified["gone"]; ok {
-			t.Error("verified entry survived the resource's deletion")
+		if cond := condition(t, r, "group-a", netcupv1alpha1.ConditionVerified); cond == nil ||
+			cond.Status != metav1.ConditionTrue {
+			t.Errorf("Verified = %+v, want True after a successful check", cond)
 		}
 	})
+}
+
+func TestReconcile_RecordsEvents(t *testing.T) {
+	srvA := int32(101)
+	api := &mockAPI{
+		servers: []scp.ServerListMinimal{server(t, srvA, "srv-a")},
+		v4:      []scp.FailoverIPv4{fv4(t, 1, "198.51.100.1", nil)},
+	}
+	r := newReconciler(t, api, testFIP("group-a", "198.51.100.1/32"), readyNode("node-a", "srv-a"), testSecret())
+	rec := events.NewFakeRecorder(10)
+	r.Recorder = rec
+
+	if _, err := reconcileOnce(t, r, "group-a"); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if got, want := drainEvents(rec), []string{"Normal Routed"}; !slices.Equal(got, want) {
+		t.Errorf("events = %v, want %v", got, want)
+	}
+
+	// An outcome nothing but a spec or node change can fix is a warning.
+	r2 := newReconciler(t, &mockAPI{}, testFIP("group-b", "198.51.100.1/32"))
+	rec2 := events.NewFakeRecorder(10)
+	r2.Recorder = rec2
+	if _, err := reconcileOnce(t, r2, "group-b"); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+	if got, want := drainEvents(rec2), []string{"Warning NoEligibleNodes"}; !slices.Equal(got, want) {
+		t.Errorf("events = %v, want %v", got, want)
+	}
 }

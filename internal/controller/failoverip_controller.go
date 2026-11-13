@@ -8,14 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -43,6 +42,10 @@ const (
 	// the API server reject the status update itself. The full error is
 	// still logged through the returned error.
 	maxConditionMessage = 1024
+
+	// Event actions: what the controller was doing when the event occurred.
+	actionRoute  = "Route"
+	actionVerify = "Verify"
 )
 
 // FailoverIPReconciler reconciles NetcupFailoverIP resources.
@@ -59,12 +62,9 @@ type FailoverIPReconciler struct {
 	// disables the check: a routed group is then only revisited on spec or
 	// Node changes.
 	ResyncInterval time.Duration
-
-	// verified records when each group's routing was last confirmed against
-	// netcup. It is in-memory on purpose: a new leader starts empty and so
-	// verifies every group once at startup.
-	mu       sync.Mutex
-	verified map[string]time.Time
+	// Recorder emits Events about a group: moved, drift corrected, rate
+	// limited, failed. Optional; nil records nothing.
+	Recorder events.EventRecorder
 }
 
 // Reconcile routes the group's failover IPs to a healthy eligible node. While
@@ -76,11 +76,7 @@ func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	var fip netcupv1alpha1.NetcupFailoverIP
 	if err := r.Get(ctx, req.NamespacedName, &fip); err != nil {
-		if apierrors.IsNotFound(err) {
-			r.forgetVerified(req.Name)
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{}, err
+		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
 	selector, err := nodeSelector(fip.Spec.NodeSelector)
@@ -105,7 +101,7 @@ func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	currentEligible := nodeByName(nodes, fip.Status.CurrentNode).Name != ""
 	verifying := currentEligible && isRouted(&fip)
 	if verifying {
-		if wait, due := r.resyncDue(fip.Name); !due {
+		if wait, due := r.resyncDue(&fip); !due {
 			return ctrl.Result{RequeueAfter: wait}, nil
 		}
 	}
@@ -153,13 +149,15 @@ func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if verifying && node.Name == fip.Status.CurrentNode {
 		drifted, err := session.Misrouted(ctx, routes, serverID)
 		if err != nil {
-			return ctrl.Result{}, r.fail(ctx, &fip, verifying, netcupv1alpha1.ReasonRoutingFailed, err)
+			return ctrl.Result{}, r.fail(ctx, &fip, verifying, netcupv1alpha1.ReasonVerificationFailed, err)
 		}
 		if len(drifted) == 0 {
-			return r.routed(fip.Name), nil
+			return r.confirmed(ctx, &fip, node.Name)
 		}
 		log.Info("netcup no longer routes these failover IPs to the current node, re-routing",
 			"ips", drifted, "node", node.Name, "server", serverName)
+		r.event(&fip, corev1.EventTypeWarning, netcupv1alpha1.EventReasonDriftDetected, actionVerify,
+			"netcup no longer routes %s to node %s; routing back", strings.Join(drifted, ", "), node.Name)
 		if err := r.setCondition(ctx, &fip, metav1.ConditionFalse, netcupv1alpha1.ReasonRouting,
 			fmt.Sprintf("netcup routing changed outside the controller; re-routing to node %s", node.Name)); err != nil {
 			return ctrl.Result{}, err
@@ -182,6 +180,8 @@ func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := session.EnsureRouted(ctx, routes, serverID); err != nil {
 		if netcup.IsRateLimited(err) {
 			log.Info("netcup rate limit hit, requeueing", "requeue", rateLimitRequeue)
+			r.event(&fip, corev1.EventTypeWarning, netcupv1alpha1.ReasonRateLimited, actionRoute,
+				"netcup routing rate limit hit; retrying in %s", rateLimitRequeue)
 			return ctrl.Result{RequeueAfter: rateLimitRequeue}, r.setCondition(ctx, &fip, metav1.ConditionFalse,
 				netcupv1alpha1.ReasonRateLimited, "waiting out the netcup failover routing rate limit")
 		}
@@ -189,53 +189,75 @@ func (r *FailoverIPReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	}
 
 	log.Info("failover IPs routed", "node", node.Name, "server", serverName)
-	// The message says what was verified: netcup's routing, not that the node
-	// answers on the addresses.
-	if err := r.setCondition(ctx, &fip, metav1.ConditionTrue, netcupv1alpha1.ReasonNodeSelected,
-		fmt.Sprintf("netcup routes the failover IPs to node %s", node.Name)); err != nil {
-		return ctrl.Result{}, err
-	}
-	return r.routed(fip.Name), nil
+	r.event(&fip, corev1.EventTypeNormal, netcupv1alpha1.EventReasonRouted, actionRoute,
+		"netcup routes %s to node %s", strings.Join(fip.Spec.IPs, ", "), node.Name)
+	return r.confirmed(ctx, &fip, node.Name)
 }
 
 // resyncDue reports whether the group's routing should be checked against
 // netcup now, and otherwise how long until it should. With the check disabled
 // it is never due and nothing is requeued.
-func (r *FailoverIPReconciler) resyncDue(name string) (wait time.Duration, due bool) {
+//
+// The last check is read from status, not kept in memory, so it survives
+// restarts and leader changes and is visible on the resource. A check that
+// failed did not advance it, so it stays due and is retried with backoff.
+func (r *FailoverIPReconciler) resyncDue(fip *netcupv1alpha1.NetcupFailoverIP) (wait time.Duration, due bool) {
 	if r.ResyncInterval <= 0 {
 		return 0, false
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	last, ok := r.verified[name]
-	if !ok {
+	last := fip.Status.LastVerifiedTime
+	if last == nil {
 		return 0, true
 	}
-	if wait = r.ResyncInterval - time.Since(last); wait <= 0 {
+	wait = r.ResyncInterval - time.Since(last.Time)
+	if wait <= 0 {
 		return 0, true
 	}
-	return wait, false
+	// A timestamp from a leader whose clock ran ahead must not postpone the
+	// check beyond one interval.
+	return min(wait, r.ResyncInterval), false
 }
 
-// routed records that netcup's routing was just confirmed for the group and
-// returns the result that schedules the next check.
-func (r *FailoverIPReconciler) routed(name string) ctrl.Result {
-	if r.ResyncInterval <= 0 {
-		return ctrl.Result{}
+// confirmed records that netcup routes the group to node as of now, and
+// schedules the next drift check.
+func (r *FailoverIPReconciler) confirmed(
+	ctx context.Context,
+	fip *netcupv1alpha1.NetcupFailoverIP,
+	node string,
+) (ctrl.Result, error) {
+	fip.Status.LastVerifiedTime = new(metav1.Now())
+	// The message says what was verified: netcup's routing, not that the node
+	// answers on the addresses.
+	r.condition(fip, netcupv1alpha1.ConditionRouted, metav1.ConditionTrue, netcupv1alpha1.ReasonNodeSelected,
+		fmt.Sprintf("netcup routes the failover IPs to node %s", node))
+	r.condition(fip, netcupv1alpha1.ConditionVerified, metav1.ConditionTrue, netcupv1alpha1.ReasonRoutingConfirmed,
+		"netcup's routing matched at lastVerifiedTime")
+	if err := r.writeStatus(ctx, fip); err != nil {
+		return ctrl.Result{}, err
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.verified == nil {
-		r.verified = map[string]time.Time{}
-	}
-	r.verified[name] = time.Now()
-	return ctrl.Result{RequeueAfter: r.ResyncInterval}
+	// Zero (check disabled) means no requeue.
+	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
-func (r *FailoverIPReconciler) forgetVerified(name string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.verified, name)
+// event records a Kubernetes Event about the group. Events on cluster-scoped
+// objects are stored in the default namespace.
+func (r *FailoverIPReconciler) event(
+	fip *netcupv1alpha1.NetcupFailoverIP,
+	eventType, reason, action, format string,
+	args ...any,
+) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(fip, nil, eventType, reason, action, "%s", truncate(fmt.Sprintf(format, args...)))
+}
+
+// truncate caps text destined for a condition message or an event note.
+func truncate(message string) string {
+	if len(message) > maxConditionMessage {
+		return strings.ToValidUTF8(message[:maxConditionMessage], "") + "…"
+	}
+	return message
 }
 
 // isRouted reports whether routing completed for the current spec generation.
@@ -294,27 +316,42 @@ func (r *FailoverIPReconciler) persistToken(ctx context.Context, name string, to
 	}
 }
 
-// setCondition sets the Routed condition and writes the status.
+// condition sets one condition on the in-memory resource.
+func (r *FailoverIPReconciler) condition(
+	fip *netcupv1alpha1.NetcupFailoverIP,
+	conditionType string,
+	status metav1.ConditionStatus,
+	reason, message string,
+) {
+	meta.SetStatusCondition(&fip.Status.Conditions, metav1.Condition{
+		Type:               conditionType,
+		Status:             status,
+		Reason:             reason,
+		Message:            truncate(message),
+		ObservedGeneration: fip.Generation,
+	})
+}
+
+func (r *FailoverIPReconciler) writeStatus(ctx context.Context, fip *netcupv1alpha1.NetcupFailoverIP) error {
+	if err := r.Status().Update(ctx, fip); err != nil {
+		return fmt.Errorf("updating status of %s: %w", fip.Name, err)
+	}
+	return nil
+}
+
+// setCondition sets the Routed condition and writes the status. Verified
+// describes a routed group, so it is dropped whenever Routed is not True.
 func (r *FailoverIPReconciler) setCondition(
 	ctx context.Context,
 	fip *netcupv1alpha1.NetcupFailoverIP,
 	status metav1.ConditionStatus,
 	reason, message string,
 ) error {
-	if len(message) > maxConditionMessage {
-		message = strings.ToValidUTF8(message[:maxConditionMessage], "") + "…"
+	r.condition(fip, netcupv1alpha1.ConditionRouted, status, reason, message)
+	if status != metav1.ConditionTrue {
+		meta.RemoveStatusCondition(&fip.Status.Conditions, netcupv1alpha1.ConditionVerified)
 	}
-	meta.SetStatusCondition(&fip.Status.Conditions, metav1.Condition{
-		Type:               netcupv1alpha1.ConditionRouted,
-		Status:             status,
-		Reason:             reason,
-		Message:            message,
-		ObservedGeneration: fip.Generation,
-	})
-	if err := r.Status().Update(ctx, fip); err != nil {
-		return fmt.Errorf("updating status of %s: %w", fip.Name, err)
-	}
-	return nil
+	return r.writeStatus(ctx, fip)
 }
 
 // unroutable records an outcome that retrying cannot fix: it resolves only
@@ -326,15 +363,17 @@ func (r *FailoverIPReconciler) unroutable(
 	reason, message string,
 ) error {
 	logf.FromContext(ctx).Info("cannot route failover IPs", "reason", reason, "detail", message)
+	r.event(fip, corev1.EventTypeWarning, reason, actionRoute, "%s", message)
 	return r.setCondition(ctx, fip, metav1.ConditionFalse, reason, message)
 }
 
-// fail records a retryable failure on the Routed condition and returns err so
-// the reconcile is requeued with backoff.
+// fail records a retryable failure and returns err so the reconcile is
+// requeued with backoff.
 //
-// While only verifying an already routed group the condition is left alone:
-// failing to ask netcup says nothing about where the IPs are routed, and the
-// check is retried with backoff until it gets an answer.
+// While only verifying an already routed group, Routed is left alone: failing
+// to ask netcup says nothing about where the IPs are routed. The failure goes
+// on the Verified condition instead, so a long-broken token or API outage
+// shows that Routed may be stale.
 func (r *FailoverIPReconciler) fail(
 	ctx context.Context,
 	fip *netcupv1alpha1.NetcupFailoverIP,
@@ -343,8 +382,11 @@ func (r *FailoverIPReconciler) fail(
 	err error,
 ) error {
 	if verifying {
-		return fmt.Errorf("verifying routing of %s: %w", fip.Name, err)
+		r.event(fip, corev1.EventTypeWarning, reason, actionVerify, "checking netcup's routing: %v", err)
+		r.condition(fip, netcupv1alpha1.ConditionVerified, metav1.ConditionFalse, reason, err.Error())
+		return errors.Join(fmt.Errorf("verifying routing of %s: %w", fip.Name, err), r.writeStatus(ctx, fip))
 	}
+	r.event(fip, corev1.EventTypeWarning, reason, actionRoute, "%v", err)
 	return errors.Join(err, r.setCondition(ctx, fip, metav1.ConditionFalse, reason, err.Error()))
 }
 

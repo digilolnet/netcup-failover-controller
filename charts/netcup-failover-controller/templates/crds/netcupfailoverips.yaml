@@ -26,6 +26,10 @@ spec:
         - name: Routed
           type: string
           jsonPath: .status.conditions[?(@.type=="Routed")].status
+        - name: Verified
+          type: date
+          jsonPath: .status.lastVerifiedTime
+          priority: 1
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -94,9 +98,19 @@ spec:
                   description: |
                     The node the IPs are routed to. While the Routed condition is
                     False it names the node currently being routed to.
+                lastVerifiedTime:
+                  type: string
+                  format: date-time
+                  description: |
+                    When netcup's routing was last confirmed to match currentNode,
+                    either by routing there or by the periodic drift check.
                 conditions:
                   type: array
-                  description: Standard Kubernetes conditions; the controller reports a single "Routed" condition.
+                  description: |
+                    Standard Kubernetes conditions. "Routed" is True once netcup
+                    routes every IP to currentNode. "Verified" reports the most
+                    recent check of that against netcup: False means netcup could
+                    not be asked, so Routed may be stale.
                   x-kubernetes-list-type: map
                   x-kubernetes-list-map-keys: [type]
                   items:

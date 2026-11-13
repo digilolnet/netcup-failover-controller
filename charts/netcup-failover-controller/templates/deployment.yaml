@@ -20,6 +20,9 @@ spec:
         {{- include "netcup-failover-controller.labels" . | nindent 8 }}
     spec:
       serviceAccountName: {{ include "netcup-failover-controller.name" . }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
