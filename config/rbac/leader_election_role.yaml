@@ -6,9 +6,15 @@ metadata:
   name: netcup-failover-controller-leader-election
   namespace: netcup-system
 rules:
+  # create cannot be limited by name; reading and renewing is limited to the
+  # controller's own lease (LeaderElectionID in main.go).
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get, create, update]
+    verbs: [create]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    resourceNames: [netcup-failover-controller.digilol.net]
+    verbs: [get, update]
   - apiGroups: [""]
     resources: [events]
     verbs: [create, patch]

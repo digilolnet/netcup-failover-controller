@@ -5,13 +5,13 @@ metadata:
 rules:
   - apiGroups: [netcup.digilol.net]
     resources: [netcupfailoverips]
-    verbs: [get, list, watch]
+    verbs: [list, watch]
   - apiGroups: [netcup.digilol.net]
     resources: [netcupfailoverips/status]
-    verbs: [patch, update]
+    verbs: [update]
   - apiGroups: [""]
     resources: [nodes]
-    verbs: [get, list, watch]
+    verbs: [list, watch]
 ---
 # Events about NetcupFailoverIP resources. Events on cluster-scoped objects
 # are stored in the default namespace, so the grant is a Role there instead
@@ -24,7 +24,7 @@ metadata:
 rules:
   - apiGroups: [events.k8s.io]
     resources: [events]
-    verbs: [create, patch, update]
+    verbs: [create, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

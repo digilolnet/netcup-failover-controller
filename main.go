@@ -98,8 +98,9 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:           scheme,
-		LeaderElection:   true,
+		Scheme:         scheme,
+		LeaderElection: true,
+		// The leader-election Role names this lease; keep the two in sync.
 		LeaderElectionID: "netcup-failover-controller.digilol.net",
 		// Explicit so the controller can also run out-of-cluster (dev/testing).
 		LeaderElectionNamespace: namespace,
