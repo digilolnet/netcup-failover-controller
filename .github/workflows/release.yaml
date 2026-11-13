@@ -51,11 +51,16 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ${{ env.IMAGE }}
+          # `latest` follows final releases only: a pre-release tag (anything
+          # with a hyphen, e.g. v1.2.0-rc.1) publishes just its own version.
+          # The semver patterns below already skip X.Y and X for pre-releases.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push
         id: push

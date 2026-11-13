@@ -22,11 +22,11 @@ Multiple `NetcupFailoverIP` resources are spread across different nodes for band
 
 `Routed=True` means netcup routes the group's IPs to the server of `status.currentNode`. It does **not** mean the node answers on those addresses: the controller never configures or probes them. A node that is `Ready` but cannot serve the address (see [Node Network Configuration](#node-network-configuration)) is still a valid target, and the resource will show `Routed=True` while the address is unreachable. Monitor the failover addresses from outside the cluster.
 
-A node counts as healthy when its `Ready` condition is true, so a hard crash is only acted on once Kubernetes marks the node `NotReady`.
+A node counts as healthy when its `Ready` condition is true, so a hard crash is only acted on once Kubernetes marks the node `NotReady`. In a test where the holder was powered off, that took about 47 seconds and the address was unreachable for 49; the controller itself routed within a second or two of the node turning `NotReady`. To shorten this, tune Kubernetes' node failure detection, not the controller.
 
 netcup rate-limits failover routing (10 requests per 5 minutes). When the limit is hit the controller records a `RateLimited` condition and retries after 5 minutes — IPs that already routed are never re-routed, so a large group converges across windows.
 
-The controller runs with two replicas and leader election — one active, one standby. A pod that shuts down cleanly hands the lease over at once. If the active pod dies with its node, the standby takes over when the lease expires, about 15 seconds later (controller-runtime's defaults). That runs in parallel with Kubernetes noticing the dead node, which takes longer by default, so it should not add to the failover time; this case has not been tested.
+The controller runs with two replicas and leader election — one active, one standby. A pod that shuts down cleanly hands the lease over at once. If the active pod dies with its node, the standby takes over when the lease expires, about 15 seconds later (controller-runtime's defaults). That runs in parallel with Kubernetes noticing the dead node, which takes longer by default, so it does not add to the failover time: in a test that powered off the node running the active pod, the standby held the lease after about 15 seconds, well before the node was marked `NotReady`.
 
 ## Prerequisites
 
@@ -57,7 +57,7 @@ machine:
 
 netcup routes the failover IPs to the server, so they do not have to be on the public interface, and a single `/128` is enough for IPv6: the failover `/64` itself is not needed anywhere.
 
-This layout was tested on three Talos control planes sharing one netcup segment. Both families answered from outside on the holder, and a clean reboot of the IPv6 holder re-routed the prefix in about 2 seconds with no failed probe out of 183 over three minutes. A failover of the IPv4 group in this layout and a hard crash of the holder have not been tested.
+This layout was tested on three Talos control planes sharing one netcup segment. Both families answered from outside on the holder, and a clean reboot of the IPv6 holder re-routed the prefix in about 2 seconds with no failed probe out of 183 over three minutes. A clean reboot of the IPv4 holder re-routed the address in 2 seconds, with 5 of 179 probes lost while the lease also changed hands. For a hard crash of the holder, see [What `Routed=True` means](#what-routedtrue-means).
 
 ### The node's EUI-64 address must stay on the public interface
 
@@ -334,7 +334,7 @@ git tag vX.Y.Z
 git push origin vX.Y.Z
 ```
 
-Everything is derived from the tag — no version bumps in the repo are needed. Images are tagged as `X.Y.Z`, `X.Y`, `X`, and `latest`, signed with cosign, and published with provenance and SBOM attestations. The same workflow sets the chart's `version`/`appVersion` from the tag, packages it, and publishes it to the Helm repo on GitHub Pages.
+Everything is derived from the tag — no version bumps in the repo are needed. Images are tagged as `X.Y.Z`, `X.Y`, `X`, and `latest`; a pre-release tag such as `v1.2.0-rc.1` publishes only its own version and never moves `latest`. Images are signed with cosign, and published with provenance and SBOM attestations. The same workflow sets the chart's `version`/`appVersion` from the tag, packages it, and publishes it to the Helm repo on GitHub Pages.
 
 ## License
 
